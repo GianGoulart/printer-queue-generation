@@ -1,0 +1,33 @@
+# Celery
+celery==5.3.6
+redis==5.0.1
+
+# Database
+sqlalchemy==2.0.25
+psycopg2-binary==2.9.9
+
+# Storage Drivers (Phase 2)
+boto3==1.34.20
+aioboto3==12.3.0
+dropbox==12.0.2
+aiofiles==23.2.1
+
+# Image Processing (Phase 2)
+Pillow==10.2.0
+
+# Security (Phase 2)
+cryptography==42.0.1
+
+# Utilities
+python-dotenv==1.0.0
+pydantic==2.10.6
+pydantic-settings==2.7.1
+
+# Phase 3 - PDF Parsing
+docling==2.68.0
+pypdf2==3.0.1
+PyMuPDF==1.23.26  # fitz - for coordinate-based PDF text extraction
+
+# Phase 4 - PDF Generation & Layout
+reportlab==4.0.9
+pypdf==4.0.2

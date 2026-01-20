@@ -1,0 +1,3 @@
+"""Printer Queue Service API."""
+
+__version__ = "0.1.0"
