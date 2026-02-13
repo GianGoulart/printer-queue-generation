@@ -1,0 +1,1691 @@
+openapi: 3.0.3
+info:
+  title: Printer Queue Generation API
+  description: |
+    API para geração de filas de impressão com empacotamento automático de imagens.
+    
+    ## Funcionalidades Principais
+    
+    - **Gestão de Tenants**: Multi-tenancy com isolamento de dados
+    - **Gestão de Máquinas**: Configuração de máquinas de impressão por tenant
+    - **Gestão de Assets**: Catálogo de imagens indexadas por SKU
+    - **Gestão de Perfis de Dimensionamento**: Perfis para dimensionamento automático de imagens
+    - **Gestão de Storage**: Configuração de storage (S3, Local, Dropbox)
+    - **Processamento de Jobs**: Upload de picklists PDF, resolução de SKUs, empacotamento e geração de PDFs
+    - **Image Packing**: Upload direto de imagens para empacotamento sem validação de SKU
+    
+    ## Autenticação
+    
+    A API usa multi-tenancy baseado em header `X-Tenant-ID`. Todos os endpoints (exceto `/healthz`) requerem este header.
+    
+    ## Status de Jobs
+    
+    - `queued`: Job criado, aguardando processamento
+    - `processing`: Job sendo processado pelo worker
+    - `needs_input`: Job precisa de resolução manual de SKUs
+    - `completed`: Job processado com sucesso
+    - `failed`: Job falhou durante processamento
+    
+    ## Modos de Processamento
+    
+    - `sequence`: Processa itens na ordem exata do picklist PDF
+    - `optimize`: Otimiza layout para minimizar número de bases e desperdício
+    
+  version: 1.0.0
+  contact:
+    name: API Support
+    email: support@example.com
+
+servers:
+  - url: http://localhost:8000
+    description: Local development server
+  - url: https://api.example.com
+    description: Production server
+
+tags:
+  - name: health
+    description: Health check endpoints
+  - name: tenants
+    description: Tenant management
+  - name: machines
+    description: Machine management
+  - name: sizing-profiles
+    description: Sizing profile management
+  - name: storage-configs
+    description: Storage configuration management
+  - name: assets
+    description: Asset catalog management
+  - name: storage
+    description: Storage operations
+  - name: jobs
+    description: Job processing and management
+  - name: image-packing
+    description: Direct image packing without SKU validation
+
+paths:
+  /healthz:
+    get:
+      tags:
+        - health
+      summary: Health check
+      description: Simple health check endpoint for Kubernetes/Docker
+      operationId: healthz
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /v1/tenants:
+    get:
+      tags:
+        - tenants
+      summary: List all tenants
+      description: List all tenants in the system
+      operationId: listTenants
+      parameters:
+        - name: include_inactive
+          in: query
+          description: Include inactive tenants
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: List of tenants
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TenantResponse'
+    
+    post:
+      tags:
+        - tenants
+      summary: Create a new tenant
+      description: Create a new tenant in the system
+      operationId: createTenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantCreate'
+      responses:
+        '201':
+          description: Tenant created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /v1/tenants/{tenant_id}:
+    get:
+      tags:
+        - tenants
+      summary: Get tenant by ID
+      operationId: getTenant
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+      responses:
+        '200':
+          description: Tenant details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    
+    put:
+      tags:
+        - tenants
+      summary: Update tenant
+      operationId: updateTenant
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantUpdate'
+      responses:
+        '200':
+          description: Tenant updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/machines:
+    get:
+      tags:
+        - machines
+      summary: List machines for tenant
+      description: List all machines configured for the current tenant
+      operationId: listMachines
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      responses:
+        '200':
+          description: List of machines
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MachineResponse'
+    
+    post:
+      tags:
+        - machines
+      summary: Create a new machine
+      description: Create a new machine configuration for the tenant
+      operationId: createMachine
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MachineCreate'
+      responses:
+        '201':
+          description: Machine created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MachineResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /v1/machines/{machine_id}:
+    get:
+      tags:
+        - machines
+      summary: Get machine by ID
+      operationId: getMachine
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/MachineId'
+      responses:
+        '200':
+          description: Machine details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MachineResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    
+    put:
+      tags:
+        - machines
+      summary: Update machine
+      operationId: updateMachine
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/MachineId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MachineUpdate'
+      responses:
+        '200':
+          description: Machine updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MachineResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    
+    delete:
+      tags:
+        - machines
+      summary: Delete machine
+      operationId: deleteMachine
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/MachineId'
+      responses:
+        '204':
+          description: Machine deleted successfully
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/sizing-profiles:
+    get:
+      tags:
+        - sizing-profiles
+      summary: List sizing profiles for tenant
+      operationId: listSizingProfiles
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      responses:
+        '200':
+          description: List of sizing profiles
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SizingProfileResponse'
+    
+    post:
+      tags:
+        - sizing-profiles
+      summary: Create sizing profile
+      operationId: createSizingProfile
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SizingProfileCreate'
+      responses:
+        '201':
+          description: Sizing profile created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SizingProfileResponse'
+
+  /v1/sizing-profiles/{profile_id}:
+    get:
+      tags:
+        - sizing-profiles
+      summary: Get sizing profile by ID
+      operationId: getSizingProfile
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/ProfileId'
+      responses:
+        '200':
+          description: Sizing profile details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SizingProfileResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    
+    put:
+      tags:
+        - sizing-profiles
+      summary: Update sizing profile
+      operationId: updateSizingProfile
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/ProfileId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SizingProfileUpdate'
+      responses:
+        '200':
+          description: Sizing profile updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SizingProfileResponse'
+    
+    delete:
+      tags:
+        - sizing-profiles
+      summary: Delete sizing profile
+      operationId: deleteSizingProfile
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/ProfileId'
+      responses:
+        '204':
+          description: Sizing profile deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/storage-configs:
+    get:
+      tags:
+        - storage-configs
+      summary: Get storage configuration for tenant
+      operationId: getStorageConfig
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      responses:
+        '200':
+          description: Storage configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StorageConfigResponse'
+        '404':
+          description: Storage not configured
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail:
+                    type: string
+    
+    post:
+      tags:
+        - storage-configs
+      summary: Create or update storage configuration
+      operationId: createStorageConfig
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StorageConfigCreate'
+      responses:
+        '201':
+          description: Storage configuration created/updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StorageConfigResponse'
+
+  /v1/assets:
+    get:
+      tags:
+        - assets
+      summary: List assets with pagination
+      operationId: listAssets
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Paginated list of assets
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssetListResponse'
+    
+    post:
+      tags:
+        - assets
+      summary: Create asset manually
+      operationId: createAsset
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssetCreate'
+      responses:
+        '201':
+          description: Asset created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssetResponse'
+
+  /v1/assets/reindex:
+    post:
+      tags:
+        - assets
+      summary: Trigger asset reindexation
+      description: |
+        Dispatches an asynchronous task to reindex all assets from tenant's storage.
+        The task will:
+        - List all files in storage
+        - Extract SKU from filenames
+        - Extract image metadata (dimensions, DPI, format)
+        - Upsert assets in database
+      operationId: reindexAssets
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssetReindexRequest'
+      responses:
+        '202':
+          description: Reindexation task started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssetReindexResponse'
+
+  /v1/assets/reindex/{task_id}:
+    get:
+      tags:
+        - assets
+      summary: Get reindexation task status
+      operationId: getReindexStatus
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - name: task_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Task status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssetReindexStatus'
+
+  /v1/assets/search:
+    post:
+      tags:
+        - assets
+      summary: Search assets by SKU
+      description: Fuzzy search for assets by SKU (normalized)
+      operationId: searchAssets
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssetSearchRequest'
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssetSearchResponse'
+
+  /v1/storage/test:
+    post:
+      tags:
+        - storage
+      summary: Test storage connection
+      description: Test if storage is configured and accessible
+      operationId: testStorage
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      responses:
+        '200':
+          description: Storage test result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StorageTestResponse'
+
+  /v1/jobs:
+    post:
+      tags:
+        - jobs
+      summary: Upload picklist PDF and create job
+      description: |
+        Upload a picklist PDF file and create a new job for processing.
+        
+        **Business Rules:**
+        - File must be PDF format
+        - Maximum file size: 10MB
+        - Job is created with status 'queued'
+        - Worker task is automatically enqueued
+        - Mode 'sequence' processes items in PDF order
+        - Mode 'optimize' optimizes layout to minimize bases and waste
+        
+        **Processing Pipeline:**
+        1. Parse PDF to extract SKUs and quantities
+        2. Resolve SKUs against asset catalog
+        3. If unresolved SKUs exist, job status becomes 'needs_input'
+        4. Apply sizing profiles to items
+        5. Pack items into bases using selected mode
+        6. Generate print-ready PDFs for each base
+      operationId: uploadPicklist
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Picklist PDF file (max 10MB)
+                mode:
+                  type: string
+                  enum: [sequence, optimize]
+                  default: sequence
+                  description: Processing mode
+                sizing_profile_id:
+                  type: integer
+                  description: Optional default sizing profile ID
+                machine_id:
+                  type: integer
+                  description: Optional target machine ID
+      responses:
+        '201':
+          description: Job created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobCreateResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          description: File too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    
+    get:
+      tags:
+        - jobs
+      summary: List jobs with pagination
+      operationId: listJobs
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [queued, processing, needs_input, completed, failed]
+      responses:
+        '200':
+          description: Paginated list of jobs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobListResponse'
+
+  /v1/jobs/{job_id}:
+    get:
+      tags:
+        - jobs
+      summary: Get job details
+      description: Get detailed information about a job including items
+      operationId: getJobDetail
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Job details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobDetailResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    
+    delete:
+      tags:
+        - jobs
+      summary: Delete/cancel job
+      description: Delete a job. Only queued or failed jobs can be deleted.
+      operationId: deleteJob
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '204':
+          description: Job deleted successfully
+        '400':
+          description: Job cannot be deleted (e.g., currently processing)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/jobs/{job_id}/pending-items:
+    get:
+      tags:
+        - jobs
+      summary: Get pending items
+      description: |
+        Get items that need manual resolution (missing or ambiguous SKUs).
+        Returns items with status 'missing' or 'ambiguous'.
+        For ambiguous items, includes candidate assets with similarity scores.
+      operationId: getPendingItems
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: List of pending items
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PendingItemsResponse'
+        '400':
+          description: Job is not in 'needs_input' status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/jobs/{job_id}/resolve:
+    post:
+      tags:
+        - jobs
+      summary: Resolve pending items manually
+      description: |
+        Manually resolve items by assigning asset IDs.
+        After resolution, if all items are resolved, job processing continues automatically.
+      operationId: resolveItems
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/JobId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobResolveRequest'
+      responses:
+        '200':
+          description: Items resolved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResolveResponse'
+        '400':
+          description: Invalid resolution (e.g., asset not found, item already resolved)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/jobs/{job_id}/skip:
+    post:
+      tags:
+        - jobs
+      summary: Skip pending items
+      description: |
+        Skip items that don't have matching images. These items will be excluded from the generated base.
+        After skipping, if all items are resolved or skipped, job processing continues automatically.
+        
+        **Use cases:**
+        - Item SKU not found in asset catalog
+        - User chooses to generate base without this item
+        - Item will be marked as "skipped" and excluded from packing
+      operationId: skipItems
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/JobId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobSkipRequest'
+      responses:
+        '200':
+          description: Items skipped successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobSkipResponse'
+        '400':
+          description: Invalid request (e.g., job not in needs_input state, item not found)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/jobs/{job_id}/outputs:
+    get:
+      tags:
+        - jobs
+      summary: Get job output PDFs
+      description: Get list of generated PDF files for completed jobs
+      operationId: getJobOutputs
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: List of output PDFs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobOutputsResponse'
+        '400':
+          description: Job is not completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/jobs/{job_id}/bases/{base_index}/pdf:
+    get:
+      tags:
+        - jobs
+      summary: Download base PDF
+      description: Download a specific base PDF for a completed job
+      operationId: downloadBasePdf
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/JobId'
+        - name: base_index
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        '200':
+          description: PDF file
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Job not completed or base not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/image-packing/upload:
+    post:
+      tags:
+        - image-packing
+      summary: Upload images for automatic packing
+      description: |
+        Upload images or ZIP file for automatic packing/layout generation.
+        
+        **Key Features:**
+        - No SKU validation required
+        - No sizing profiles needed
+        - Accepts multiple image files or a single ZIP archive
+        - Automatically extracts images from ZIP
+        - Calculates dimensions from image metadata (DPI, pixels)
+        - Generates best possible layout to minimize bases and waste
+        - Respects machine dimensions and cut margins
+        
+        **Supported Formats:**
+        - PNG, JPEG, GIF, WebP, BMP, TIFF
+        - ZIP archives containing images
+        
+        **Processing:**
+        - Images are processed asynchronously
+        - Job status can be checked via `/status/{job_id}`
+        - Result can be downloaded as multi-page PDF via `/download/{job_id}`
+      operationId: uploadImages
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - files
+                - machine_width_mm
+                - machine_length_mm
+              properties:
+                files:
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+                  description: Image files or ZIP archive
+                mode:
+                  type: string
+                  enum: [sequence, optimize]
+                  default: optimize
+                  description: Packing mode
+                machine_width_mm:
+                  type: number
+                  format: float
+                  description: Machine width in millimeters
+                machine_length_mm:
+                  type: number
+                  format: float
+                  description: Machine length in millimeters
+      responses:
+        '201':
+          description: Images uploaded, processing started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImagePackingUploadResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /v1/image-packing/status/{job_id}:
+    get:
+      tags:
+        - image-packing
+      summary: Get image packing job status
+      description: Get current status and progress of an image packing job
+      operationId: getImagePackingStatus
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Job status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImagePackingStatusResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/image-packing/result/{job_id}:
+    get:
+      tags:
+        - image-packing
+      summary: Get image packing result
+      description: Get packing result (bases, placements, utilization) for completed jobs
+      operationId: getImagePackingResult
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Packing result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImagePackingResultResponse'
+        '400':
+          description: Job not completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/image-packing/download/{job_id}:
+    get:
+      tags:
+        - image-packing
+      summary: Download packing result as PDF
+      description: Download generated layout as a multi-page PDF (one page per base)
+      operationId: downloadImagePackingResult
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Multi-page PDF file
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Job not completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  parameters:
+    TenantIdHeader:
+      name: X-Tenant-ID
+      in: header
+      required: true
+      description: Tenant ID for multi-tenancy
+      schema:
+        type: integer
+    
+    TenantId:
+      name: tenant_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    
+    MachineId:
+      name: machine_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    
+    ProfileId:
+      name: profile_id
+      in: path
+      required: true
+      schema:
+        type: integer
+    
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema:
+        type: integer
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        detail:
+          type: string
+          description: Error message
+
+    TenantResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        is_active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    
+    TenantCreate:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+    
+    TenantUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+        is_active:
+          type: boolean
+
+    MachineResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+        tenant_id:
+          type: integer
+        name:
+          type: string
+        max_width_mm:
+          type: number
+          format: float
+          description: Maximum width in millimeters
+        max_length_mm:
+          type: number
+          format: float
+          description: Maximum length in millimeters
+        min_dpi:
+          type: integer
+          description: Minimum DPI requirement
+          default: 300
+        created_at:
+          type: string
+          format: date-time
+    
+    MachineCreate:
+      type: object
+      required:
+        - name
+        - max_width_mm
+        - max_length_mm
+      properties:
+        name:
+          type: string
+        max_width_mm:
+          type: number
+          format: float
+          minimum: 0
+        max_length_mm:
+          type: number
+          format: float
+          minimum: 0
+        min_dpi:
+          type: integer
+          minimum: 72
+          default: 300
+    
+    MachineUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+        max_width_mm:
+          type: number
+          format: float
+          minimum: 0
+        max_length_mm:
+          type: number
+          format: float
+          minimum: 0
+        min_dpi:
+          type: integer
+          minimum: 72
+
+    SizingProfileResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+        tenant_id:
+          type: integer
+        size_label:
+          type: string
+        target_width_mm:
+          type: number
+          format: float
+        sku_prefix:
+          type: string
+          nullable: true
+        is_default:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+    
+    SizingProfileCreate:
+      type: object
+      required:
+        - size_label
+        - target_width_mm
+      properties:
+        size_label:
+          type: string
+        target_width_mm:
+          type: number
+          format: float
+        sku_prefix:
+          type: string
+          nullable: true
+        is_default:
+          type: boolean
+          default: false
+    
+    SizingProfileUpdate:
+      type: object
+      properties:
+        size_label:
+          type: string
+        target_width_mm:
+          type: number
+          format: float
+        sku_prefix:
+          type: string
+          nullable: true
+        is_default:
+          type: boolean
+
+    StorageConfigResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+        tenant_id:
+          type: integer
+        provider:
+          type: string
+          enum: [local, s3, dropbox]
+        base_path:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    
+    StorageConfigCreate:
+      type: object
+      required:
+        - provider
+        - base_path
+        - credentials
+      properties:
+        provider:
+          type: string
+          enum: [local, s3, dropbox]
+        base_path:
+          type: string
+        credentials:
+          type: object
+          description: Provider-specific credentials (encrypted before storage)
+
+    AssetResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+        tenant_id:
+          type: integer
+        sku_normalized:
+          type: string
+        original_filename:
+          type: string
+        file_uri:
+          type: string
+        metadata_json:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    
+    AssetCreate:
+      type: object
+      required:
+        - tenant_id
+        - sku_normalized
+        - original_filename
+        - file_uri
+      properties:
+        tenant_id:
+          type: integer
+        sku_normalized:
+          type: string
+        original_filename:
+          type: string
+        file_uri:
+          type: string
+        metadata_json:
+          type: string
+          nullable: true
+    
+    AssetListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AssetResponse'
+        total:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+        pages:
+          type: integer
+    
+    AssetReindexRequest:
+      type: object
+      properties:
+        force:
+          type: boolean
+          default: false
+          description: Force reindex even if assets exist
+    
+    AssetReindexResponse:
+      type: object
+      properties:
+        task_id:
+          type: string
+        status:
+          type: string
+        message:
+          type: string
+    
+    AssetReindexStatus:
+      type: object
+      properties:
+        task_id:
+          type: string
+        status:
+          type: string
+          enum: [pending, started, success, failure]
+        result:
+          type: object
+          nullable: true
+        error:
+          type: string
+          nullable: true
+    
+    AssetSearchRequest:
+      type: object
+      required:
+        - sku
+      properties:
+        sku:
+          type: string
+        limit:
+          type: integer
+          default: 10
+          maximum: 50
+    
+    AssetSearchResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              asset_id:
+                type: integer
+              sku:
+                type: string
+              file_uri:
+                type: string
+              score:
+                type: number
+                format: float
+
+    StorageTestResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, error]
+        provider:
+          type: string
+        message:
+          type: string
+        base_path:
+          type: string
+
+    JobCreateResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+        status:
+          type: string
+          enum: [queued, processing, needs_input, completed, failed]
+        mode:
+          type: string
+          enum: [sequence, optimize]
+        picklist_uri:
+          type: string
+        machine_id:
+          type: integer
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    
+    JobDetailResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+        tenant_id:
+          type: integer
+        machine_id:
+          type: integer
+          nullable: true
+        sizing_profile_id:
+          type: integer
+          nullable: true
+        status:
+          type: string
+        mode:
+          type: string
+        picklist_uri:
+          type: string
+        manifest_json:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        items_count:
+          type: integer
+        items_resolved:
+          type: integer
+        items_pending:
+          type: integer
+        items_skipped:
+          type: integer
+    
+    JobListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: integer
+              status:
+                type: string
+              mode:
+                type: string
+              picklist_uri:
+                type: string
+              items_count:
+                type: integer
+              created_at:
+                type: string
+                format: date-time
+              updated_at:
+                type: string
+                format: date-time
+        total:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+        pages:
+          type: integer
+    
+    PendingItemsResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: integer
+              sku:
+                type: string
+              quantity:
+                type: integer
+              size_label:
+                type: string
+                nullable: true
+              status:
+                type: string
+                enum: [missing, ambiguous]
+              candidates:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    asset_id:
+                      type: integer
+                    sku:
+                      type: string
+                    file_uri:
+                      type: string
+                    score:
+                      type: number
+                      format: float
+    
+    JobResolveRequest:
+      type: object
+      required:
+        - resolutions
+      properties:
+        resolutions:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required:
+              - item_id
+              - asset_id
+            properties:
+              item_id:
+                type: integer
+              asset_id:
+                type: integer
+    
+    JobResolveResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        resolved_count:
+          type: integer
+        job_status:
+          type: string
+        message:
+          type: string
+    
+    JobSkipRequest:
+      type: object
+      required:
+        - item_ids
+      properties:
+        item_ids:
+          type: array
+          minItems: 1
+          items:
+            type: integer
+          description: List of item IDs to skip
+    
+    JobSkipResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        skipped_count:
+          type: integer
+        job_status:
+          type: string
+        message:
+          type: string
+    
+    JobOutputsResponse:
+      type: object
+      properties:
+        pdfs:
+          type: array
+          items:
+            type: string
+            description: URI of PDF file in storage
+        previews:
+          type: array
+          items:
+            type: string
+
+    ImagePackingUploadResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [queued]
+        message:
+          type: string
+    
+    ImagePackingStatusResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [queued, processing, completed, failed]
+        progress:
+          type: integer
+          nullable: true
+          minimum: 0
+          maximum: 100
+        message:
+          type: string
+          nullable: true
+        result:
+          $ref: '#/components/schemas/ImagePackingResultResponse'
+          nullable: true
+        error:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    
+    ImagePackingResultResponse:
+      type: object
+      properties:
+        total_bases:
+          type: integer
+        total_length_mm:
+          type: number
+          format: float
+        avg_utilization:
+          type: number
+          format: float
+        mode:
+          type: string
+          enum: [sequence, optimize]
+        bases:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              width_mm:
+                type: number
+                format: float
+              length_mm:
+                type: number
+                format: float
+              utilization:
+                type: number
+                format: float
+              items_count:
+                type: integer
+              placements:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      item_id:
+                        type: integer
+                      sku:
+                        type: string
+                      x_mm:
+                        type: number
+                        format: float
+                      y_mm:
+                        type: number
+                        format: float
+                      width_mm:
+                        type: number
+                        format: float
+                      height_mm:
+                        type: number
+                        format: float
+                      rotated:
+                        type: boolean
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    
+    InternalServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'

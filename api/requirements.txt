@@ -22,6 +22,9 @@ aiofiles==23.2.1
 # Image Processing (Phase 2)
 Pillow==10.2.0
 
+# PDF Generation (Phase 4)
+reportlab==4.0.9
+
 # Security (Phase 2)
 cryptography==42.0.0
 

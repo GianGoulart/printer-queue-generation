@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
+API_CODE_ROOT = Path("/api_code")
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -18,6 +20,45 @@ logger = logging.getLogger(__name__)
 # Create database connection for worker
 engine = create_engine(settings.database_url, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def _load_api_modules():
+    """Load API modules from /api_code so reindex can use sku_extractor, asset_service, etc."""
+    if not API_CODE_ROOT.is_dir():
+        raise FileNotFoundError(
+            f"API code path not found: {API_CODE_ROOT}. "
+            "In Docker, mount the api folder: -v ./api:/api_code"
+        )
+    app_dir = API_CODE_ROOT / "app"
+    if not (app_dir / "services" / "sku_extractor.py").exists():
+        raise FileNotFoundError(
+            f"API app not found under {API_CODE_ROOT}. Expected {app_dir}/services/sku_extractor.py"
+        )
+    api_code_str = str(API_CODE_ROOT)
+    # Remove worker's app from cache so 'app' resolves to API's app
+    to_remove = [k for k in sys.modules if k == "app" or k.startswith("app.")]
+    for k in to_remove:
+        del sys.modules[k]
+    # Build path with /api_code first and /app removed, so Python finds app under /api_code only
+    path_without_app = [p for p in sys.path if p != "/app" and p != api_code_str]
+    old_path = sys.path.copy()
+    sys.path = [api_code_str] + path_without_app
+    try:
+        import app.services.sku_extractor as sku_extractor_module  # noqa: E402
+        import app.services.image_metadata as image_metadata_module  # noqa: E402
+        import app.services.asset_service as asset_service_module  # noqa: E402
+        import app.storage.factory as storage_factory_module  # noqa: E402
+        import app.models.sizing_profile as sizing_profile_module  # noqa: E402
+        return {
+            "extract_sku": sku_extractor_module.extract_sku,
+            "extract_image_metadata": image_metadata_module.extract_image_metadata,
+            "ImageMetadataError": image_metadata_module.ImageMetadataError,
+            "upsert_asset": asset_service_module.upsert_asset,
+            "get_storage_driver": storage_factory_module.get_storage_driver,
+            "SizingProfile": sizing_profile_module.SizingProfile,
+        }
+    finally:
+        sys.path = old_path
 
 
 @celery_app.task(name="app.tasks.reindex.reindex_assets", bind=True)
@@ -49,36 +90,26 @@ def reindex_assets(self, tenant_id: int) -> Dict[str, Any]:
         >>> result.get()
         {'total': 20, 'success': 18, 'failed': 2, 'skipped': 0}
     """
-    # CRITICAL: Temporarily manipulate sys.path and sys.modules to load API modules
-    # Save original state
+    # Load API modules from /api_code (clears worker's app from cache for this task only)
     original_sys_path = sys.path.copy()
-    original_app_module = sys.modules.get('app')
-    
+    original_app_modules = {k: v for k, v in sys.modules.items() if k == "app" or k.startswith("app.")}
     try:
-        # Remove worker's app module temporarily
-        if 'app' in sys.modules:
-            del sys.modules['app']
-        
-        # Put /api_code FIRST in sys.path
-        sys.path.insert(0, "/api_code")
-        
-        # Now import API modules normally - they will come from /api_code
-        from app.services.sku_extractor import extract_sku
-        from app.services.image_metadata import extract_image_metadata, ImageMetadataError
-        from app.services.asset_service import upsert_asset
-        from app.storage.factory import get_storage_driver
-        
+        api = _load_api_modules()
+        extract_sku = api["extract_sku"]
+        extract_image_metadata = api["extract_image_metadata"]
+        ImageMetadataError = api["ImageMetadataError"]
+        upsert_asset = api["upsert_asset"]
+        get_storage_driver = api["get_storage_driver"]
+        SizingProfile = api.get("SizingProfile")
     finally:
-        # Restore worker's app module
-        if original_app_module is not None:
-            sys.modules['app'] = original_app_module
-        
-        # Restore original sys.path
+        # Restore worker's app so other tasks keep using worker code
+        for k in list(sys.modules):
+            if k == "app" or k.startswith("app."):
+                del sys.modules[k]
+        for k, v in original_app_modules.items():
+            sys.modules[k] = v
         sys.path = original_sys_path
-    
-    # At this point, the functions are loaded and ready to use
-    # (they hold references to their API modules)
-    
+
     db = SessionLocal()
     
     try:
@@ -116,13 +147,38 @@ def reindex_assets(self, tenant_id: int) -> Dict[str, Any]:
 
         logger.info(f"Found {len(files)} files for tenant {tenant_id}")
 
-        # Filter image files
+        # Filter image files (match on "name" or "path" for basename)
         image_extensions = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-        image_files = [
-            f for f in files if Path(f["name"]).suffix.lower() in image_extensions
-        ]
+        image_files = []
+        for f in files:
+            name = f.get("name") or Path(f.get("path", "")).name
+            suffix = Path(name).suffix.lower()
+            if suffix in image_extensions:
+                image_files.append(f)
+            elif len(files) <= 20:
+                logger.debug(f"Skip non-image: path={f.get('path')} name={name} suffix={suffix}")
 
+        if len(files) > 0 and len(image_files) == 0:
+            sample = [f.get("path", f.get("name", "?")) for f in files[:10]]
+            logger.warning(
+                f"No image files found (extensions: {image_extensions}). "
+                f"Sample of {len(files)} files: {sample}"
+            )
         logger.info(f"Processing {len(image_files)} image files")
+
+        # Load tenant sizing profile prefixes for SKU extraction (strip only these from start)
+        sizing_prefixes = None
+        if SizingProfile:
+            try:
+                profiles = db.query(SizingProfile).filter(
+                    SizingProfile.tenant_id == tenant_id,
+                    SizingProfile.sku_prefix.isnot(None),
+                ).all()
+                sizing_prefixes = [p.sku_prefix.strip() for p in profiles if p.sku_prefix]
+                if sizing_prefixes:
+                    logger.info(f"Using tenant sizing prefixes for SKU extraction: {sizing_prefixes[:5]}{'...' if len(sizing_prefixes) > 5 else ''}")
+            except Exception as e:
+                logger.warning(f"Could not load sizing profiles for tenant {tenant_id}: {e}")
 
         # Process each file
         total = len(image_files)
@@ -148,8 +204,8 @@ def reindex_assets(self, tenant_id: int) -> Dict[str, Any]:
 
                 logger.info(f"[{idx}/{total}] Processing {filename}")
 
-                # Extract SKU from filename
-                sku = extract_sku(filename)
+                # Extract SKU from filename (tenant prefixes strip only sizing profile prefixes from start)
+                sku = extract_sku(filename, sizing_prefixes=sizing_prefixes)
                 if not sku:
                     logger.warning(f"Could not extract SKU from {filename}, skipping")
                     skipped += 1

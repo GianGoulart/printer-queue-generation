@@ -34,20 +34,30 @@ class RenderService:
         items_map: dict,
         assets_map: dict,
         storage_driver
-    ) -> List[str]:
-        """Render all bases to PDFs."""
+    ) -> tuple[List[str], List[dict]]:
+        """
+        Render all bases to PDFs.
+        
+        Returns:
+            Tuple of (pdf_uris, failed_items) where failed_items is a list of dicts
+            with item_id, sku, and reason for failure
+        """
         pdf_uris = []
+        all_failed_items = []
         
         for base in bases:
             try:
                 # Render single base
-                pdf_content = await self.render_base(
+                pdf_content, failed_items = await self.render_base(
                     base=base,
                     job=job,
                     items_map=items_map,
                     assets_map=assets_map,
                     storage_driver=storage_driver
                 )
+                
+                # Collect failed items
+                all_failed_items.extend(failed_items)
                 
                 # Validate PDF before saving
                 if not pdf_content or len(pdf_content) < 100:
@@ -67,7 +77,7 @@ class RenderService:
                 logger.error(f"Error rendering base {base.index} for job {job.id}: {e}", exc_info=True)
                 raise
         
-        return pdf_uris
+        return pdf_uris, all_failed_items
     
     async def render_base(
         self,
@@ -76,8 +86,14 @@ class RenderService:
         items_map: dict,
         assets_map: dict,
         storage_driver
-    ) -> bytes:
-        """Render single base to PDF."""
+    ) -> tuple[bytes, List[dict]]:
+        """
+        Render single base to PDF.
+        
+        Returns:
+            Tuple of (pdf_content, failed_items) where failed_items is a list of dicts
+            with item_id, sku, and reason for failure
+        """
         # Create PDF in memory
         buffer = io.BytesIO()
         
@@ -96,44 +112,154 @@ class RenderService:
         
         items_drawn = 0
         items_failed = 0
+        failed_items = []  # Track failed items with details
         
         # Draw each placement
         for placement in base.placements:
             try:
                 # Get item and asset
                 item = items_map.get(placement.item_id)
-                if not item or not item.asset_id:
-                    logger.warning(f"Skipping placement {placement.item_id}: no asset")
+                if not item:
+                    reason = "Item not found in items_map"
+                    logger.error(f"Skipping placement {placement.item_id}: {reason}")
                     items_failed += 1
+                    failed_items.append({
+                        "item_id": placement.item_id,
+                        "sku": getattr(placement, 'sku', 'unknown'),
+                        "reason": reason
+                    })
+                    continue
+                
+                if not item.asset_id:
+                    reason = "No asset_id assigned to item"
+                    logger.error(f"Skipping placement {placement.item_id} (SKU: {item.sku}): {reason}")
+                    items_failed += 1
+                    failed_items.append({
+                        "item_id": placement.item_id,
+                        "sku": item.sku,
+                        "reason": reason
+                    })
                     continue
                 
                 asset = assets_map.get(item.asset_id)
                 if not asset:
-                    logger.warning(f"Skipping placement {placement.item_id}: asset not found")
+                    reason = f"Asset {item.asset_id} not found in database"
+                    logger.error(
+                        f"Skipping placement {placement.item_id} (SKU: {item.sku}): {reason}"
+                    )
                     items_failed += 1
+                    failed_items.append({
+                        "item_id": placement.item_id,
+                        "sku": item.sku,
+                        "reason": reason
+                    })
                     continue
                 
                 # Validate placement boundaries
                 if not self._validate_placement(placement, base.width_mm, base.length_mm):
-                    logger.error(f"Skipping placement {placement.item_id}: out of bounds")
+                    reason = "Placement out of base boundaries"
+                    logger.error(f"Skipping placement {placement.item_id}: {reason}")
                     items_failed += 1
+                    failed_items.append({
+                        "item_id": placement.item_id,
+                        "sku": item.sku,
+                        "reason": reason
+                    })
                     continue
                 
                 # Download image from storage
-                image_content = await storage_driver.download_file(asset.file_uri)
+                try:
+                    image_content = await storage_driver.download_file(asset.file_uri)
+                except Exception as download_error:
+                    reason = f"Failed to download from storage: {str(download_error)}"
+                    logger.error(
+                        f"Skipping placement {placement.item_id} (SKU: {item.sku}): {reason}",
+                        exc_info=True
+                    )
+                    items_failed += 1
+                    failed_items.append({
+                        "item_id": placement.item_id,
+                        "sku": item.sku,
+                        "reason": reason,
+                        "file_uri": asset.file_uri
+                    })
+                    continue
                 
                 if not image_content:
-                    logger.error(f"Skipping placement {placement.item_id}: empty image content")
+                    reason = "Empty image content from storage"
+                    logger.error(
+                        f"Skipping placement {placement.item_id} (SKU: {item.sku}): {reason}"
+                    )
                     items_failed += 1
+                    failed_items.append({
+                        "item_id": placement.item_id,
+                        "sku": item.sku,
+                        "reason": reason,
+                        "file_uri": asset.file_uri
+                    })
+                    continue
+                
+                # Validate that content looks like an image (check magic bytes)
+                if len(image_content) < 8:
+                    reason = f"File too small ({len(image_content)} bytes)"
+                    logger.error(
+                        f"Skipping placement {placement.item_id} (SKU: {item.sku}): {reason}"
+                    )
+                    items_failed += 1
+                    failed_items.append({
+                        "item_id": placement.item_id,
+                        "sku": item.sku,
+                        "reason": reason,
+                        "file_uri": asset.file_uri
+                    })
+                    continue
+                
+                # Check for common image magic bytes
+                is_valid_image = False
+                magic_bytes = image_content[:8]
+                # PNG: 89 50 4E 47 0D 0A 1A 0A
+                # JPEG: FF D8 FF
+                # GIF: 47 49 46 38 (GIF8)
+                if (magic_bytes.startswith(b'\x89PNG\r\n\x1a\n') or
+                    magic_bytes.startswith(b'\xff\xd8\xff') or
+                    magic_bytes.startswith(b'GIF8') or
+                    magic_bytes.startswith(b'RIFF') or  # WebP
+                    magic_bytes.startswith(b'BM')):  # BMP
+                    is_valid_image = True
+                
+                if not is_valid_image:
+                    reason = f"Invalid image format (magic bytes: {magic_bytes.hex()})"
+                    logger.error(
+                        f"Skipping placement {placement.item_id} (SKU: {item.sku}): {reason}"
+                    )
+                    items_failed += 1
+                    failed_items.append({
+                        "item_id": placement.item_id,
+                        "sku": item.sku,
+                        "reason": reason,
+                        "file_uri": asset.file_uri
+                    })
                     continue
                 
                 # Create temporary file for image
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
+                # Determine file extension from magic bytes or asset filename
+                file_ext = '.png'
+                if magic_bytes.startswith(b'\xff\xd8\xff'):
+                    file_ext = '.jpg'
+                elif magic_bytes.startswith(b'GIF8'):
+                    file_ext = '.gif'
+                elif magic_bytes.startswith(b'RIFF'):
+                    file_ext = '.webp'
+                elif magic_bytes.startswith(b'BM'):
+                    file_ext = '.bmp'
+                
+                with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
                     tmp_file.write(image_content)
                     tmp_path = tmp_file.name
                 
                 try:
                     # Process image (convert to RGB if needed, remove transparency)
+                    # This will also validate that the image can be opened
                     processed_path = self._process_image(tmp_path)
                     
                     # ✅ FIX: Inverter coordenada Y (ReportLab usa origem inferior esquerda)
@@ -160,8 +286,20 @@ class RenderService:
                     )
                     
                 except Exception as e:
-                    logger.error(f"Error processing/drawing image for {placement.item_id}: {e}", exc_info=True)
+                    reason = f"Error processing/drawing image: {str(e)}"
+                    logger.error(
+                        f"Error processing/drawing image for placement {placement.item_id} "
+                        f"(SKU: {item.sku}, asset_id: {item.asset_id}, file_uri: {asset.file_uri}): {e}",
+                        exc_info=True
+                    )
                     items_failed += 1
+                    failed_items.append({
+                        "item_id": placement.item_id,
+                        "sku": item.sku,
+                        "reason": reason,
+                        "file_uri": asset.file_uri,
+                        "asset_id": item.asset_id
+                    })
                     
                 finally:
                     # Clean up temp files
@@ -173,11 +311,19 @@ class RenderService:
                                 logger.warning(f"Could not delete temp file {path}: {e}")
                         
             except Exception as e:
+                reason = f"Unexpected error: {str(e)}"
+                sku = getattr(placement, 'sku', 'unknown')
                 logger.error(
-                    f"Error drawing placement {placement.item_id} on base {base.index}: {e}",
+                    f"Error drawing placement {placement.item_id} (SKU: {sku}) "
+                    f"on base {base.index}: {e}",
                     exc_info=True
                 )
                 items_failed += 1
+                failed_items.append({
+                    "item_id": placement.item_id,
+                    "sku": sku,
+                    "reason": reason
+                })
         
         # ✅ FIX: Finaliza a página antes de salvar
         c.showPage()
@@ -202,7 +348,7 @@ class RenderService:
             logger.error(f"Base {base.index} was rendered but contains NO images!")
             raise ValueError(f"No items could be drawn on base {base.index}")
         
-        return pdf_content
+        return pdf_content, failed_items
     
     def _process_image(self, image_path: str) -> str:
         """
@@ -210,11 +356,12 @@ class RenderService:
         Converts RGBA/LA/P to RGB, handles transparency.
         
         Returns path to processed image.
+        
+        Raises:
+            UnidentifiedImageError: If the file is not a valid image
         """
         try:
             with Image.open(image_path) as img:
-                # ✅ NÃO usar verify() - corrompe o arquivo
-                
                 # Se já é RGB/L, retorna o original
                 if img.mode in ('RGB', 'L'):
                     return image_path
@@ -234,24 +381,32 @@ class RenderService:
                     else:
                         rgb_img.paste(img)
                     
+                    img.close()
+                    
                     # Salva processada
-                    processed_path = image_path.replace('.png', '_processed.png')
+                    file_ext = Path(image_path).suffix
+                    processed_path = image_path.replace(file_ext, '_processed.png')
                     rgb_img.save(processed_path, 'PNG', quality=self.COMPRESSION_QUALITY)
+                    rgb_img.close()
                     
                     logger.debug(f"Converted image from {img.mode} to RGB: {processed_path}")
                     return processed_path
                 
                 # Outros modos: converte direto para RGB
                 rgb_img = img.convert('RGB')
-                processed_path = image_path.replace('.png', '_processed.png')
+                img.close()
+                
+                file_ext = Path(image_path).suffix
+                processed_path = image_path.replace(file_ext, '_processed.png')
                 rgb_img.save(processed_path, 'PNG', quality=self.COMPRESSION_QUALITY)
+                rgb_img.close()
                 
                 return processed_path
                 
         except Exception as e:
             logger.error(f"Error processing image {image_path}: {e}", exc_info=True)
-            # Retorna original em caso de erro
-            return image_path
+            # Re-raise to let caller handle it
+            raise
     
     def _validate_placement(
         self,

@@ -225,7 +225,12 @@ def get_job_detail(db: Session, job_id: int, tenant_id: int) -> JobDetailRespons
     
     pending_items = db.query(func.count(JobItem.id)).filter(
         JobItem.job_id == job_id,
-        JobItem.status.in_(["missing", "ambiguous"])
+        JobItem.status.in_(["missing", "ambiguous", "needs_input"])
+    ).scalar()
+    
+    skipped_items = db.query(func.count(JobItem.id)).filter(
+        JobItem.job_id == job_id,
+        JobItem.status == "skipped"
     ).scalar()
     
     return JobDetailResponse(
@@ -265,17 +270,35 @@ def get_pending_items(
     Raises:
         JobNotFoundError: If job not found
     """
+    from app.services.asset_service import search_assets_by_sku
+    from app.services.sku_extractor import normalize_sku, sku_to_design
+    
     job = get_job_by_id(db, job_id, tenant_id)
     
-    # Get pending items
+    # Load tenant sizing prefixes to compute sku_design (strip prefixes from item.sku)
+    sizing_prefixes = []
+    try:
+        profiles = db.query(SizingProfile).filter(
+            SizingProfile.tenant_id == tenant_id,
+            SizingProfile.sku_prefix.isnot(None),
+        ).all()
+        sizing_prefixes = [p.sku_prefix for p in profiles if p.sku_prefix]
+    except Exception:
+        pass
+    
+    # Get pending items (missing, ambiguous, or needs_input from render failures)
     pending_items = db.query(JobItem).filter(
         JobItem.job_id == job_id,
-        JobItem.status.in_(["missing", "ambiguous"])
+        JobItem.status.in_(["missing", "ambiguous", "needs_input"])
     ).all()
     
     result = []
     for item in pending_items:
+        sku_design = sku_to_design(item.sku, sizing_prefixes) if sizing_prefixes else None
+        if sku_design and sku_design == normalize_sku(item.sku or ""):
+            sku_design = None  # no prefix was stripped, avoid redundant value
         candidates = []
+        candidate_asset_ids = set()  # Track asset IDs to avoid duplicates
         
         # Parse candidates from manifest_json if exists
         if job.manifest_json:
@@ -285,18 +308,56 @@ def get_pending_items(
                 candidate_data = item_data.get("candidates", [])
                 
                 for candidate in candidate_data:
-                    candidates.append(AssetCandidate(
-                        asset_id=candidate["asset_id"],
-                        sku=candidate["sku"],
-                        file_uri=candidate["file_uri"],
-                        score=candidate["score"]
-                    ))
+                    asset_id = candidate["asset_id"]
+                    if asset_id not in candidate_asset_ids:
+                        candidates.append(AssetCandidate(
+                            asset_id=asset_id,
+                            sku=candidate["sku"],
+                            file_uri=candidate["file_uri"],
+                            score=candidate["score"]
+                        ))
+                        candidate_asset_ids.add(asset_id)
             except (json.JSONDecodeError, KeyError):
                 pass
+        
+        # Also search for assets dynamically in the database (by full SKU and by design SKU)
+        # Assets are indexed by design-only after reindex; job item sku may include size prefix
+        try:
+            search_queries = [item.sku]
+            if sku_design and sku_design != item.sku:
+                search_queries.append(sku_design)
+            for search_sku in search_queries:
+                search_results = search_assets_by_sku(
+                    db=db,
+                    tenant_id=tenant_id,
+                    sku=search_sku,
+                    threshold=0.3,  # Minimum similarity threshold
+                    limit=10
+                )
+            
+                for asset, score in search_results:
+                    # Only add if not already in candidates
+                    if asset.id not in candidate_asset_ids:
+                        candidates.append(AssetCandidate(
+                            asset_id=asset.id,
+                            sku=asset.sku_normalized,
+                            file_uri=asset.file_uri,
+                            score=float(score)
+                        ))
+                        candidate_asset_ids.add(asset.id)
+        except Exception as e:
+            # Log error but don't fail the request
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to search assets for SKU {item.sku}: {e}")
+        
+        # Sort candidates by score (highest first)
+        candidates.sort(key=lambda c: c.score, reverse=True)
         
         result.append(PendingItemResponse(
             id=item.id,
             sku=item.sku,
+            sku_design=sku_design or None,
             quantity=item.quantity,
             size_label=item.size_label,
             status=item.status,
@@ -361,10 +422,10 @@ def resolve_items(
         item.status = "resolved"
         resolved_count += 1
     
-    # Check if all items are now resolved
+    # Check if all items are now resolved or skipped
     pending_count = db.query(func.count(JobItem.id)).filter(
         JobItem.job_id == job_id,
-        JobItem.status.in_(["missing", "ambiguous"])
+        JobItem.status.in_(["missing", "ambiguous", "needs_input"])
     ).scalar()
     
     # Update job status
@@ -379,6 +440,75 @@ def resolve_items(
     db.commit()
     
     return resolved_count, new_status
+
+
+def skip_items(
+    db: Session,
+    job_id: int,
+    tenant_id: int,
+    item_ids: List[int]
+) -> Tuple[int, str]:
+    """
+    Skip job items (mark as skipped to generate base without them).
+    
+    Args:
+        db: Database session
+        job_id: Job ID
+        tenant_id: Tenant ID
+        item_ids: List of item IDs to skip
+        
+    Returns:
+        Tuple of (skipped_count, new_job_status)
+        
+    Raises:
+        JobNotFoundError: If job not found
+        InvalidJobStateError: If job is not in needs_input state
+    """
+    job = get_job_by_id(db, job_id, tenant_id)
+    
+    if job.status != "needs_input":
+        raise InvalidJobStateError(
+            f"Job {job_id} is not in 'needs_input' state (current: {job.status})"
+        )
+    
+    skipped_count = 0
+    
+    for item_id in item_ids:
+        # Get the item
+        item = db.query(JobItem).filter(
+            JobItem.id == item_id,
+            JobItem.job_id == job_id
+        ).first()
+        
+        if not item:
+            continue
+        
+        # Only skip items that are missing, ambiguous, or needs_input
+        if item.status not in ["missing", "ambiguous", "needs_input"]:
+            continue
+        
+        # Mark as skipped
+        item.status = "skipped"
+        skipped_count += 1
+    
+    # Check if all items are now resolved or skipped
+    pending_count = db.query(func.count(JobItem.id)).filter(
+        JobItem.job_id == job_id,
+        JobItem.status.in_(["missing", "ambiguous", "needs_input"])
+    ).scalar()
+    
+    # Update job status
+    if pending_count == 0:
+        job.status = "queued"  # Re-queue for processing
+        new_status = "queued"
+    else:
+        new_status = "needs_input"  # Still has pending items
+    
+    job.updated_at = datetime.utcnow()
+    
+    db.commit()
+    
+    return skipped_count, new_status
 
 
 def delete_job(db: Session, job_id: int, tenant_id: int) -> None:

@@ -25,6 +25,7 @@ class Tenant(Base):
     assets = relationship("Asset", back_populates="tenant", cascade="all, delete-orphan")
     jobs = relationship("Job", back_populates="tenant", cascade="all, delete-orphan")
     sizing_profiles = relationship("SizingProfile", back_populates="tenant", cascade="all, delete-orphan")
+    sku_layouts = relationship("SkuLayout", back_populates="tenant", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Tenant(id={self.id}, name={self.name})>"

@@ -7,6 +7,9 @@ from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# File extensions we accept when metadata format is missing/UNKNOWN (Pillow may not detect format)
+SUPPORTED_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+
 
 @dataclass
 class SizingResult:
@@ -23,8 +26,8 @@ class SizingResult:
 class SizingService:
     """Apply sizing profiles and validate items."""
     
-    # Supported image formats
-    SUPPORTED_FORMATS = ["PNG", "JPEG", "JPG", "GIF", "WEBP"]
+    # Supported image formats (must match render_service magic-byte checks; BMP is accepted there)
+    SUPPORTED_FORMATS = ["PNG", "JPEG", "JPG", "GIF", "WEBP", "BMP"]
     
     # Margins for machine constraints
     SIDE_MARGIN_MM = 20  # Each side
@@ -68,19 +71,24 @@ class SizingService:
                 error_message="Invalid asset metadata JSON"
             )
         
-        # Validate format
+        # Validate format (metadata or fallback to file extension when UNKNOWN/missing)
         if not self.validate_format(metadata):
-            return SizingResult(
-                final_width_mm=0,
-                final_height_mm=0,
-                scale_applied=0,
-                warnings=[],
-                is_valid=False,
-                error_message=f"Unsupported image format. Supported: {', '.join(self.SUPPORTED_FORMATS)}"
-            )
+            if self._format_acceptable_from_asset(asset):
+                warnings.append(
+                    f"Asset format not in metadata (or UNKNOWN); accepted by file extension. "
+                    f"SKU: {getattr(job_item, 'sku', '?')}"
+                )
+            else:
+                return SizingResult(
+                    final_width_mm=0,
+                    final_height_mm=0,
+                    scale_applied=0,
+                    warnings=[],
+                    is_valid=False,
+                    error_message=f"Unsupported image format. Supported: {', '.join(self.SUPPORTED_FORMATS)}"
+                )
         
         # Validate DPI (warning only, not blocking)
-        warnings = []
         dpi_check = metadata.get('dpi', 0)
         if isinstance(dpi_check, (list, tuple)):
             dpi_check = min(dpi_check)
@@ -155,6 +163,18 @@ class SizingService:
         
         return dpi >= min_dpi
     
+    def _format_acceptable_from_asset(self, asset) -> bool:
+        """
+        Return True if the asset's file has a supported extension (used when metadata format is missing/UNKNOWN).
+        """
+        for attr in ("file_uri", "original_filename"):
+            path = getattr(asset, attr, None) or ""
+            if isinstance(path, str) and path.strip():
+                ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
+                if ext in SUPPORTED_EXTENSIONS:
+                    return True
+        return False
+
     def validate_format(self, asset_metadata: dict) -> bool:
         """
         Validate image format is supported.
@@ -165,7 +185,9 @@ class SizingService:
         Returns:
             True if format is supported
         """
-        format_type = asset_metadata.get('format', '').upper()
+        format_type = (asset_metadata.get("format") or "").strip().upper()
+        if not format_type or format_type == "UNKNOWN":
+            return False
         return format_type in self.SUPPORTED_FORMATS
     
     def calculate_dimensions(

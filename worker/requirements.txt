@@ -31,3 +31,6 @@ PyMuPDF==1.23.26  # fitz - for coordinate-based PDF text extraction
 # Phase 4 - PDF Generation & Layout
 reportlab==4.0.9
 pypdf==4.0.2
+
+# Phase 4 - 2D Bin Packing
+rectpack==0.2.2

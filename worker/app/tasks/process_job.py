@@ -34,6 +34,7 @@ def process_job(self, job_id: int) -> dict:
         import sys
         import importlib.util
         from datetime import datetime
+        from sqlalchemy import func
         from sqlalchemy.orm import Session
         
         # Import worker services using relative imports
@@ -60,6 +61,9 @@ def process_job(self, job_id: int) -> dict:
         
         import app.models.job_item as api_job_item_module
         JobItem = api_job_item_module.JobItem
+
+        import app.models.sku_layout as api_sku_layout_module
+        SkuLayout = api_sku_layout_module.SkuLayout
         
         import app.storage.factory as api_storage_module
         get_storage_driver = api_storage_module.get_storage_driver
@@ -107,43 +111,93 @@ def process_job(self, job_id: int) -> dict:
                 except Exception as e:
                     logger.warning(f"Failed to load SKU catalog: {e}")
                     valid_skus = None
-                
+
+                # Load tenant SKU layouts (priority order) for deterministic extraction
+                tenant_layouts = []
+                try:
+                    layouts = (
+                        db.query(SkuLayout)
+                        .filter(SkuLayout.tenant_id == job.tenant_id, SkuLayout.active == True)
+                        .order_by(SkuLayout.priority.asc())
+                        .all()
+                    )
+                    tenant_layouts = [
+                        {
+                            "id": l.id,
+                            "name": l.name,
+                            "pattern": l.pattern,
+                            "pattern_type": l.pattern_type,
+                            "allow_hyphen_variants": getattr(l, "allow_hyphen_variants", True),
+                        }
+                        for l in layouts
+                    ]
+                    if tenant_layouts:
+                        logger.info(f"Loaded {len(tenant_layouts)} active SKU layouts for tenant {job.tenant_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to load SKU layouts: {e}")
+
                 # Parse PDF with RobustPDFParser (primary) or Docling (fallback)
-                parser = PDFParserService(valid_skus=valid_skus)
+                parser = PDFParserService(valid_skus=valid_skus, tenant_layouts=tenant_layouts)
                 parsed_items = asyncio.run(parser.parse_pdf(pdf_content, job.picklist_uri))
                 
                 logger.info(f"Parsed {len(parsed_items)} items from PDF")
                 
-                # Save raw extraction to manifest_json
+                # Save raw extraction to manifest_json (include extraction_method/layout_id for QA)
                 manifest_data = {
                     "raw_extraction": [
                         {
                             "sku": item.sku,
                             "quantity": item.quantity,
-                            "size_label": item.size_label
+                            "size_label": item.size_label,
+                            **({"extraction_method": item.extraction_method} if getattr(item, "extraction_method", None) else {}),
+                            **({"layout_id": item.layout_id} if getattr(item, "layout_id", None) is not None else {}),
                         }
                         for item in parsed_items
                     ],
                     "parsed_at": datetime.utcnow().isoformat(),
-                    "item_count": len(parsed_items)
+                    "item_count": len(parsed_items),
                 }
                 job.manifest_json = json.dumps(manifest_data)
                 db.commit()
                 
-                # Create job_items
-                for parsed_item in parsed_items:
-                    job_item = JobItem(
-                        job_id=job.id,
-                        sku=parsed_item.sku,
-                        quantity=parsed_item.quantity,
-                        size_label=parsed_item.size_label,
-                        picklist_position=parsed_item.position,  # ✅ Preservar ordem do picklist
-                        status="pending"  # Will be updated in Feature 7
-                    )
-                    db.add(job_item)
+                # Check if job items already exist (job was rerun)
+                existing_items_count = db.query(func.count(JobItem.id)).filter(
+                    JobItem.job_id == job.id
+                ).scalar()
                 
-                db.commit()
-                logger.info(f"Created {len(parsed_items)} job items")
+                if existing_items_count == 0:
+                    # Create job_items only if they don't exist
+                    # ✅ Expand items based on quantity: if quantity=3, create 3 separate JobItems
+                    position_counter = 1
+                    total_items_created = 0
+                    
+                    for parsed_item in parsed_items:
+                        quantity = parsed_item.quantity or 1  # Default to 1 if None
+                        
+                        # Create one JobItem for each unit in the quantity
+                        for qty_index in range(quantity):
+                            job_item = JobItem(
+                                job_id=job.id,
+                                sku=parsed_item.sku,
+                                quantity=1,  # Each physical item has quantity=1
+                                size_label=parsed_item.size_label,
+                                picklist_position=position_counter,  # ✅ Preservar ordem do picklist
+                                status="pending"  # Will be updated in Feature 7
+                            )
+                            db.add(job_item)
+                            position_counter += 1
+                            total_items_created += 1
+                    
+                    db.commit()
+                    logger.info(
+                        f"Created {total_items_created} job items from {len(parsed_items)} parsed items "
+                        f"(expanded by quantities)"
+                    )
+                else:
+                    logger.info(
+                        f"Job items already exist ({existing_items_count} items). "
+                        f"Skipping creation. This is likely a rerun."
+                    )
                 
             except PDFParserError as e:
                 logger.error(f"PDF parsing failed: {str(e)}")
@@ -155,6 +209,25 @@ def process_job(self, job_id: int) -> dict:
             
             # ===== Feature 7: Resolve SKUs =====
             resolver = SKUResolverService()
+            
+            # Load sizing profile prefixes so we can resolve by design only (e.g. bl-7-4-butterfly-p -> asset butterflyp, size from bl-7)
+            sizing_prefixes = None
+            try:
+                import app.models.sizing_profile as api_sizing_profile_module
+                SizingProfile = api_sizing_profile_module.SizingProfile
+                profiles = db.query(SizingProfile).filter(
+                    SizingProfile.tenant_id == job.tenant_id,
+                    SizingProfile.sku_prefix.isnot(None),
+                ).all()
+                sizing_prefixes = [p.sku_prefix.lower().replace("-", "").strip() for p in profiles if p.sku_prefix]
+                if sizing_prefixes:
+                    logger.info(f"Resolve by design: using sizing prefixes {sizing_prefixes} for asset lookup")
+            except Exception as e:
+                logger.debug(f"Could not load sizing prefixes for design-only resolve: {e}")
+            
+            # Get storage driver for file verification
+            # (storage_driver may have been created in Feature 6, but we'll create it here to be sure)
+            storage_driver = get_storage_driver(db, job.tenant_id)
             
             # Refresh job to get items
             db.refresh(job)
@@ -168,17 +241,84 @@ def process_job(self, job_id: int) -> dict:
             for item in job.items:
                 logger.info(f"Resolving SKU: {item.sku} (item_id={item.id})")
                 
-                resolution = asyncio.run(resolver.resolve_sku(item.sku, job.tenant_id, db))
+                resolution = asyncio.run(resolver.resolve_sku(item.sku, job.tenant_id, db, sizing_prefixes=sizing_prefixes))
+                
+                logger.info(f"Resolution result for {item.sku}: status={resolution.status}")
                 
                 if resolution.status == "resolved":
-                    # Update item with resolved asset
-                    item.asset_id = resolution.asset_id
-                    item.status = "resolved"
-                    resolved_count += 1
-                    logger.info(
-                        f"SKU resolved: {item.sku} -> asset_id={resolution.asset_id} "
-                        f"(score={resolution.score:.3f})"
-                    )
+                    # Verify that the file actually exists in storage; if primary asset's file
+                    # is missing, try other candidates (e.g. design-only asset like mario-10.png)
+                    try:
+                        import app.models.asset as api_asset_module
+                        Asset = api_asset_module.Asset
+
+                        def _candidate_list_for_verify():
+                            """Build list of (asset_id, file_uri) to try: primary first, then candidates."""
+                            primary = db.query(Asset).filter(Asset.id == resolution.asset_id).first()
+                            out = []
+                            if primary and primary.file_uri:
+                                out.append((primary.id, primary.file_uri))
+                            for c in resolution.candidates or []:
+                                if c.asset_id != resolution.asset_id and c.file_uri:
+                                    out.append((c.asset_id, c.file_uri))
+                            return out
+
+                        chosen_asset_id = None
+                        for aid, uri in _candidate_list_for_verify():
+                            try:
+                                asyncio.run(storage_driver.get_file_info(uri))
+                                chosen_asset_id = aid
+                                logger.info(
+                                    f"✅ File verified: {uri} exists -> using asset_id={aid}"
+                                )
+                                break
+                            except FileNotFoundError:
+                                logger.debug(f"Candidate asset_id={aid} file not found: {uri}, trying next")
+                            except Exception:
+                                logger.debug(f"Candidate asset_id={aid} verification failed: {uri}, trying next")
+
+                        if chosen_asset_id is None:
+                            primary_uri = None
+                            asset = db.query(Asset).filter(Asset.id == resolution.asset_id).first()
+                            if asset and asset.file_uri:
+                                primary_uri = asset.file_uri
+                            logger.warning(
+                                f"⚠️ SKU resolved but no candidate file found in storage: {item.sku} "
+                                f"(primary file_uri={primary_uri}). Treating as missing."
+                            )
+                            item.status = "missing"
+                            missing_count += 1
+                            has_pending_items = True
+                            pending_items_data[str(item.id)] = {
+                                "status": "missing",
+                                "candidates": [
+                                    {"asset_id": c.asset_id, "sku": c.sku, "file_uri": c.file_uri, "score": c.score}
+                                    for c in (resolution.candidates or [])
+                                ],
+                                "reason": f"File not found in storage: {primary_uri or 'no primary uri'}"
+                            }
+                            continue
+
+                        item.asset_id = chosen_asset_id
+                        item.status = "resolved"
+                        resolved_count += 1
+                        logger.info(
+                            f"✅ SKU resolved and verified: {item.sku} -> asset_id={chosen_asset_id}"
+                        )
+                    except Exception as verify_error:
+                        logger.error(
+                            f"⚠️ Error verifying file for resolved SKU {item.sku}: {verify_error}. "
+                            f"Treating as missing to be safe."
+                        )
+                        item.status = "missing"
+                        missing_count += 1
+                        has_pending_items = True
+                        pending_items_data[str(item.id)] = {
+                            "status": "missing",
+                            "candidates": [],
+                            "reason": f"Verification error: {str(verify_error)}"
+                        }
+                        continue
                     
                 elif resolution.status == "missing":
                     # No match found
@@ -189,7 +329,7 @@ def process_job(self, job_id: int) -> dict:
                         "status": "missing",
                         "candidates": []
                     }
-                    logger.warning(f"SKU not found: {item.sku}")
+                    logger.warning(f"⚠️ SKU NOT FOUND: {item.sku} (item_id={item.id}) - will require user input")
                     
                 elif resolution.status == "ambiguous":
                     # Multiple similar matches
@@ -209,8 +349,18 @@ def process_job(self, job_id: int) -> dict:
                         ]
                     }
                     logger.warning(
-                        f"SKU ambiguous: {item.sku} ({len(resolution.candidates)} candidates)"
+                        f"⚠️ SKU AMBIGUOUS: {item.sku} ({len(resolution.candidates)} candidates) - will require user input"
                     )
+                else:
+                    logger.error(f"⚠️ UNKNOWN RESOLUTION STATUS: {resolution.status} for SKU {item.sku}")
+                    # Treat unknown status as missing to be safe
+                    item.status = "missing"
+                    missing_count += 1
+                    has_pending_items = True
+                    pending_items_data[str(item.id)] = {
+                        "status": "missing",
+                        "candidates": []
+                    }
             
             # Update manifest with resolution results and pending items data
             manifest = json.loads(job.manifest_json) if job.manifest_json else {}
@@ -226,14 +376,42 @@ def process_job(self, job_id: int) -> dict:
             job.manifest_json = json.dumps(manifest)
             
             # Update job status based on resolution results
+            logger.info(
+                f"Resolution summary for job {job_id}: "
+                f"resolved={resolved_count}, missing={missing_count}, ambiguous={ambiguous_count}, "
+                f"has_pending_items={has_pending_items}"
+            )
+            
             if has_pending_items:
+                logger.warning(
+                    f"🚨 Job {job_id} HAS PENDING ITEMS - setting status to 'needs_input' and STOPPING processing"
+                )
                 job.status = "needs_input"
                 job.updated_at = datetime.utcnow()
+                # Commit items status changes
                 db.commit()
+                # Refresh to ensure status is persisted
+                db.refresh(job)
                 logger.info(
-                    f"Job {job_id} needs input: {missing_count} missing, "
-                    f"{ambiguous_count} ambiguous"
+                    f"✅ Job {job_id} status set to 'needs_input': {missing_count} missing, "
+                    f"{ambiguous_count} ambiguous. Job will NOT continue processing."
                 )
+                # Return early - job needs manual intervention
+                result = {
+                    "status": "needs_input",
+                    "job_id": job_id,
+                    "items_parsed": len(parsed_items),
+                    "items_resolved": resolved_count,
+                    "items_missing": missing_count,
+                    "items_ambiguous": ambiguous_count,
+                    "job_status": "needs_input",
+                    "message": (
+                        f"Job needs input. Resolved: {resolved_count}, "
+                        f"Missing: {missing_count}, Ambiguous: {ambiguous_count}"
+                    )
+                }
+                logger.info(f"Returning early from job {job_id} processing with result: {result}")
+                return result
             else:
                 # All items resolved, continue to Phase 4: Sizing, Packing, Rendering
                 logger.info(f"Job {job_id} fully resolved: {resolved_count} items. Starting Phase 4...")
@@ -493,14 +671,39 @@ def process_job(self, job_id: int) -> dict:
                     # Prepare data for rendering
                     items_map = {item.id: item for item in items_to_pack}
                     assets_map = {}
+                    
+                    # Collect all unique asset_ids
+                    asset_ids = set()
                     for item in items_to_pack:
-                        if item.asset_id and item.asset_id not in assets_map:
-                            asset = db.query(Asset).filter(Asset.id == item.asset_id).first()
-                            if asset:
-                                assets_map[item.asset_id] = asset
+                        if item.asset_id:
+                            asset_ids.add(item.asset_id)
+                    
+                    # Load all assets in one query for better performance
+                    if asset_ids:
+                        assets = db.query(Asset).filter(Asset.id.in_(asset_ids)).all()
+                        assets_map = {asset.id: asset for asset in assets}
+                        
+                        # Log any missing assets
+                        missing_asset_ids = asset_ids - set(assets_map.keys())
+                        if missing_asset_ids:
+                            logger.warning(
+                                f"Some assets not found in database for job {job_id}: {missing_asset_ids}"
+                            )
+                            # Log which items are affected
+                            for item in items_to_pack:
+                                if item.asset_id in missing_asset_ids:
+                                    logger.warning(
+                                        f"Item {item.id} (SKU: {item.sku}) has asset_id {item.asset_id} "
+                                        f"but asset not found in database"
+                                    )
+                    
+                    logger.info(
+                        f"Prepared rendering data: {len(items_map)} items, {len(assets_map)} assets "
+                        f"for {len(packing_result.bases)} base(s)"
+                    )
                     
                     # Render all bases
-                    pdf_uris = asyncio.run(render_service.render_bases(
+                    pdf_uris, failed_items = asyncio.run(render_service.render_bases(
                         job=job,
                         bases=packing_result.bases,
                         items_map=items_map,
@@ -508,6 +711,64 @@ def process_job(self, job_id: int) -> dict:
                         storage_driver=storage_driver
                     ))
                     
+                    # Check if there are failed items
+                    if failed_items:
+                        logger.warning(
+                            f"🚨 Job {job_id} has {len(failed_items)} items that failed to render. "
+                            f"Marking job as 'needs_input'"
+                        )
+                        
+                        # Mark failed items as needs_input
+                        failed_item_ids = {item["item_id"] for item in failed_items}
+                        for item in items_to_pack:
+                            if item.id in failed_item_ids:
+                                item.status = "needs_input"
+                                logger.info(
+                                    f"Marked item {item.id} (SKU: {item.sku}) as needs_input "
+                                    f"due to render failure"
+                                )
+                        
+                        # Add failed items info to manifest
+                        manifest["render_failures"] = failed_items
+                        
+                        # Update manifest with output URIs (partial PDFs)
+                        manifest["outputs"] = {
+                            "pdfs": pdf_uris,
+                            "previews": []  # Optional for MVP
+                        }
+                        manifest["completed_at"] = None  # Not fully completed
+                        manifest["processing_time_seconds"] = None
+                        
+                        job.manifest_json = json.dumps(manifest)
+                        
+                        # Mark job as needs_input
+                        job.status = "needs_input"
+                        job.completed_at = None
+                        job.updated_at = datetime.utcnow()
+                        db.commit()
+                        
+                        logger.warning(
+                            f"Job {job_id} marked as 'needs_input' due to {len(failed_items)} "
+                            f"render failures. User can resolve by uploading new images."
+                        )
+                        
+                        # Return early with needs_input status
+                        return {
+                            "status": "needs_input",
+                            "job_id": job_id,
+                            "items_parsed": len(parsed_items),
+                            "items_resolved": resolved_count,
+                            "items_missing": 0,
+                            "items_ambiguous": 0,
+                            "items_render_failed": len(failed_items),
+                            "job_status": "needs_input",
+                            "message": (
+                                f"Job needs input. {len(failed_items)} item(s) failed to render. "
+                                f"Please upload new images or fix asset files."
+                            )
+                        }
+                    
+                    # All items rendered successfully
                     # Update manifest with output URIs
                     manifest["outputs"] = {
                         "pdfs": pdf_uris,

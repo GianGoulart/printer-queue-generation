@@ -1,17 +1,19 @@
 """SKU extraction from filenames."""
 
 import re
-from typing import Optional
+from typing import List, Optional
 
 
-# Common size suffixes to remove
-SIZE_SUFFIXES = [
-    "P", "M", "G", "GG", "XG", "PP",  # Portuguese sizes
-    "S", "L", "XL", "XXL", "XXXL",    # English sizes
-    "1", "2", "3", "4", "5", "6",     # Numeric sizes
-]
+# Unicode ligatures that must be expanded to ASCII before [^a-z0-9] strip (e.g. PDF "ﬂoyd" -> "floyd")
+_UNICODE_LIGATURES = (
+    ("\uFB02", "fl"),   # ﬂ (LATIN SMALL LIGATURE FL)
+    ("\uFB01", "fi"),   # ﬁ
+    ("\uFB00", "ff"),   # ﬀ
+    ("\uFB04", "ffl"),  # ﬄ
+    ("\uFB03", "ffi"),  # ﬃ
+)
 
-# Common side/position suffixes to remove
+# Position suffixes to remove from end (tenant size is via sizing_prefixes only)
 POSITION_SUFFIXES = [
     "FRENTE", "COSTAS", "FRONT", "BACK",
     "DIREITA", "ESQUERDA", "LEFT", "RIGHT",
@@ -48,6 +50,10 @@ def normalize_sku(sku: str) -> str:
     # Convert to lowercase
     sku = sku.lower().strip()
 
+    # Expand Unicode ligatures so "ﬂoyd" -> "floyd" (otherwise ﬂ is stripped by [^a-z0-9])
+    for lig, ascii_eq in _UNICODE_LIGATURES:
+        sku = sku.replace(lig, ascii_eq)
+
     # Remove separators
     sku = sku.replace("-", "").replace("_", "").replace(" ", "")
 
@@ -57,61 +63,104 @@ def normalize_sku(sku: str) -> str:
     return sku
 
 
-def extract_sku(filename: str) -> str:
+def sku_to_design(sku: str, sizing_prefixes: Optional[List[str]] = None) -> str:
+    """Return the design part of a SKU by stripping tenant sizing prefixes.
+
+    Same logic as the worker's resolver: normalize, strip longest prefix from start,
+    then optionally strip leading digits (e.g. inf1213sonic8 -> inf12 -> 13sonic8 -> sonic8).
+
+    Args:
+        sku: Raw SKU (e.g. from picklist: inf1213sonic8, bl74butterfly).
+        sizing_prefixes: Tenant sku_prefix values (e.g. ["inf-12", "bl-7"]). Can contain hyphens.
+
+    Returns:
+        Design-only SKU for display/lookup, or normalized sku if no prefix matched.
+    """
+    if not sku:
+        return ""
+    sku_norm = normalize_sku(sku)
+    if not sizing_prefixes:
+        return sku_norm
+    # Normalize prefixes like the worker: lower, no hyphens
+    prefixes_norm = [
+        p.strip().lower().replace("-", "").replace("_", "")
+        for p in sizing_prefixes
+        if p and p.strip()
+    ]
+    prefixes_norm = sorted(set(prefixes_norm), key=len, reverse=True)
+    remainder = sku_norm
+    for prefix in prefixes_norm:
+        if not prefix or not sku_norm.startswith(prefix):
+            continue
+        remainder = sku_norm[len(prefix) :].lstrip("-_")
+        break
+    if not remainder:
+        return sku_norm
+    # Strip leading numeric segment (e.g. 13sonic8 -> sonic8)
+    m = re.match(r"^[0-9]+[-_]?", remainder)
+    if m:
+        design = remainder[m.end() :].strip("-_") or remainder
+    else:
+        design = remainder
+    return design or sku_norm
+
+
+def extract_sku(
+    filename: str,
+    sizing_prefixes: Optional[List[str]] = None,
+) -> str:
     """Extract and normalize SKU from filename.
 
-    Extraction rules:
-    1. Remove file extension
-    2. Remove common size suffixes (P, M, G, GG, etc)
-    3. Remove common position suffixes (FRENTE, COSTAS, etc)
-    4. Remove separators
-    5. Normalize to lowercase alphanumeric
+    Uses only tenant sizing profile prefixes (sku_prefix): strip from start only those.
+    No global size list; position suffixes (FRENTE, COSTAS, etc.) are stripped from end.
 
     Args:
         filename: Filename to extract SKU from
+        sizing_prefixes: List of tenant sizing profile prefixes (e.g. ["bl-", "inf-2", "u-11"]).
+            Only these are stripped from the start (longest match first). When None, nothing is stripped from start.
 
     Returns:
-        Extracted and normalized SKU
-
-    Examples:
-        >>> extract_sku("CAM001-P.png")
-        'cam001'
-        >>> extract_sku("CAM_001_P_FRENTE.png")
-        'cam001'
-        >>> extract_sku("001-CAM-M.jpg")
-        '001cam'
-        >>> extract_sku("LOGO_EMPRESA.png")
-        'logoempresa'
-        >>> extract_sku("BASIC-SIZE-G.jpeg")
-        'basicsize'
+        Extracted and normalized SKU (lowercase, no separators)
     """
     if not filename:
         return ""
 
-    # Remove file extension
     sku = filename.rsplit(".", 1)[0]
-
-    # Convert to uppercase for easier matching
     sku_upper = sku.upper()
 
-    # Remove size suffixes
-    for suffix in SIZE_SUFFIXES:
-        # Try with separators
-        for sep in ["-", "_", " "]:
-            pattern = f"{sep}{suffix}$"
-            sku_upper = re.sub(pattern, "", sku_upper)
-            # Also try with separator before
-            pattern = f"^{suffix}{sep}"
-            sku_upper = re.sub(pattern, "", sku_upper)
+    # Strip from start only tenant sizing prefixes (longest first)
+    if sizing_prefixes:
+        sorted_prefixes = sorted(
+            [p.strip() for p in sizing_prefixes if p and p.strip()],
+            key=len,
+            reverse=True,
+        )
+        while True:
+            changed = False
+            for prefix in sorted_prefixes:
+                if not prefix:
+                    continue
+                prefix_upper = prefix.upper()
+                if sku_upper.startswith(prefix_upper):
+                    sku_upper = sku_upper[len(prefix_upper) :].lstrip("-_ ")
+                    changed = True
+                    break
+            if not changed:
+                break
 
-    # Remove position suffixes
+    # Remove position suffixes from end only
     for suffix in POSITION_SUFFIXES:
-        # Try with separators
         for sep in ["-", "_", " "]:
             pattern = f"{sep}{suffix}$"
             sku_upper = re.sub(pattern, "", sku_upper)
 
-    # Normalize
+    # If we stripped a sizing prefix, also strip leading numeric segment (position index)
+    # so "7-skull-gg" -> "skull-gg" and design-only assets match (e.g. skullgg like butterflyp)
+    if sizing_prefixes and sku_upper:
+        m = re.match(r"^[0-9]+[-_\s]*", sku_upper)
+        if m:
+            sku_upper = sku_upper[m.end() :].strip("-_ ")
+
     return normalize_sku(sku_upper)
 
 

@@ -1,8 +1,10 @@
 """Jobs API endpoints."""
 
 import json
+import logging
 import math
 import os
+from datetime import datetime
 from typing import Optional
 
 from fastapi import (
@@ -27,6 +29,8 @@ from app.schemas.job import (
     JobListResponse,
     JobResolveRequest,
     JobResolveResponse,
+    JobSkipRequest,
+    JobSkipResponse,
     PendingItemsResponse,
 )
 from app.schemas.output import BaseOutput, JobOutputsResponse
@@ -40,11 +44,13 @@ from app.services.job_service import (
     get_pending_items,
     list_jobs,
     resolve_items,
+    skip_items,
     validate_job_requirements,
 )
 from app.storage.factory import get_storage_driver
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.post("", response_model=JobCreateResponse, status_code=status.HTTP_201_CREATED)
@@ -306,6 +312,59 @@ def resolve_job_items(
         )
 
 
+@router.post("/{job_id}/skip", response_model=JobSkipResponse)
+def skip_job_items(
+    job_id: int,
+    request: JobSkipRequest,
+    db: Session = Depends(get_db),
+    tenant_id: int = Depends(get_tenant_id),
+):
+    """
+    Skip job items (generate base without them).
+    
+    - **job_id**: Job ID
+    - **item_ids**: List of item IDs to skip
+    
+    Marks items as skipped and re-queues job for processing if all items are resolved or skipped.
+    """
+    try:
+        skipped_count, new_status = skip_items(
+            db, job_id, tenant_id, request.item_ids
+        )
+        
+        # Re-enqueue if job is back to queued
+        if new_status == "queued":
+            celery_app.send_task(
+                "app.tasks.process_job.process_job",
+                args=[job_id]
+            )
+            message = f"Skipped {skipped_count} item(s). Job re-queued for processing."
+        else:
+            message = f"Skipped {skipped_count} item(s). Some items still need input."
+        
+        return JobSkipResponse(
+            status="success",
+            skipped_count=skipped_count,
+            job_status=new_status,
+            message=message
+        )
+    except JobNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e)
+        )
+    except InvalidJobStateError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to skip items: {str(e)}"
+        )
+
+
 @router.get("/{job_id}/outputs", response_model=JobOutputsResponse)
 def get_job_outputs(
     job_id: int,
@@ -468,4 +527,82 @@ async def download_base_pdf(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to download PDF: {str(e)}"
+        )
+
+
+@router.post("/{job_id}/rerun", status_code=status.HTTP_200_OK)
+def rerun_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    tenant_id: int = Depends(get_tenant_id),
+):
+    """Re-run a job by re-queuing it for processing.
+    
+    - **job_id**: Job ID
+    
+    Re-queues the job for processing. The job must be in a state that allows rerun
+    (completed, failed, or needs_input with all items resolved).
+    """
+    try:
+        # Get job
+        job = db.query(Job).filter(
+            Job.id == job_id,
+            Job.tenant_id == tenant_id
+        ).first()
+        
+        if not job:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Job {job_id} not found"
+            )
+        
+        # Check if job can be rerun
+        if job.status == "processing":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Job is currently being processed. Cannot rerun."
+            )
+        
+        # If job was in needs_input status, trigger reindex to pick up new images
+        should_reindex = job.status == "needs_input"
+        
+        if should_reindex:
+            logger.info(f"Job {job_id} was in needs_input status. Triggering asset reindex before rerun.")
+            try:
+                # Trigger asset reindexation
+                reindex_task = celery_app.send_task(
+                    "app.tasks.reindex.reindex_assets",
+                    args=[tenant_id],
+                )
+                logger.info(f"Asset reindexation task started: {reindex_task.id} for tenant {tenant_id}")
+            except Exception as e:
+                logger.warning(f"Failed to trigger reindex for job {job_id}: {e}. Continuing with rerun anyway.")
+        
+        # Reset job status to queued
+        job.status = "queued"
+        job.updated_at = datetime.utcnow()
+        db.commit()
+        
+        # Re-enqueue job for processing
+        celery_app.send_task(
+            "app.tasks.process_job.process_job",
+            args=[job_id]
+        )
+        
+        message = f"Job {job_id} re-queued for processing"
+        if should_reindex:
+            message += ". Asset reindexation triggered to pick up new images."
+        
+        return {
+            "status": "success",
+            "message": message
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to rerun job {job_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to rerun job: {str(e)}"
         )

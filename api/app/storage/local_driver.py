@@ -101,6 +101,20 @@ class LocalStorageDriver(BaseStorageDriver):
         """
         full_path = self._validate_path(file_path)
 
+        if not full_path.exists() and "/" in file_path:
+            # Fallback: try basename when files are flat under base_path
+            basename = Path(file_path).name
+            fallback = (self.base_path / basename).resolve()
+            try:
+                fallback.relative_to(self.base_path)
+            except ValueError:
+                pass
+            else:
+                if fallback.exists():
+                    async with aiofiles.open(fallback, "rb") as f:
+                        return await f.read()
+            raise FileNotFoundError(f"File not found: {file_path}")
+
         if not full_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
@@ -142,22 +156,42 @@ class LocalStorageDriver(BaseStorageDriver):
         """Get file metadata.
 
         Args:
-            file_path: Path to file
+            file_path: Path to file (relative to base_path)
 
         Returns:
             FileInfo with metadata
         """
         full_path = self._validate_path(file_path)
 
-        if not full_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
+        if full_path.exists():
+            stat = full_path.stat()
+            return FileInfo(
+                {
+                    "name": full_path.name,
+                    "path": file_path,
+                    "size_bytes": stat.st_size,
+                    "modified_at": datetime.fromtimestamp(stat.st_mtime),
+                }
+            )
 
-        stat = full_path.stat()
-        return FileInfo(
-            {
-                "name": full_path.name,
-                "path": file_path,
-                "size_bytes": stat.st_size,
-                "modified_at": datetime.fromtimestamp(stat.st_mtime),
-            }
-        )
+        # Fallback: when Asset.file_uri is e.g. "tenant/2/assets/uuid/filename.png"
+        # but files were placed flat (e.g. base_path/filename.png), try by basename.
+        if "/" in file_path:
+            basename = Path(file_path).name
+            fallback_path = (self.base_path / basename).resolve()
+            try:
+                fallback_path.relative_to(self.base_path)
+            except ValueError:
+                raise FileNotFoundError(f"File not found: {file_path}")
+            if fallback_path.exists():
+                stat = fallback_path.stat()
+                return FileInfo(
+                    {
+                        "name": fallback_path.name,
+                        "path": basename,
+                        "size_bytes": stat.st_size,
+                        "modified_at": datetime.fromtimestamp(stat.st_mtime),
+                    }
+                )
+
+        raise FileNotFoundError(f"File not found: {file_path}")

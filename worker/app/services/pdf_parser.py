@@ -13,11 +13,13 @@ logger = logging.getLogger(__name__)
 
 class PicklistItem(BaseModel):
     """Parsed item from picklist."""
-    
+
     sku: str
     quantity: int
     size_label: Optional[str] = None
-    position: Optional[int] = None  # ✅ Ordem no picklist original (1, 2, 3...)
+    position: Optional[int] = None  # Ordem no picklist original (1, 2, 3...)
+    extraction_method: Optional[str] = None  # "layout", "regex", "heuristic", "fuzzy"
+    layout_id: Optional[int] = None  # When extraction_method=="layout"
 
 
 class PDFParserError(Exception):
@@ -31,15 +33,22 @@ class PDFParserService:
     TIMEOUT_SECONDS = 60
     MAX_FILE_SIZE_MB = 10
     
-    def __init__(self, valid_skus: Optional[Set[str]] = None):
+    def __init__(
+        self,
+        valid_skus: Optional[Set[str]] = None,
+        tenant_layouts: Optional[List[dict]] = None,
+    ):
         """
         Initialize parser.
-        
+
         Args:
             valid_skus: Optional set of valid SKUs from catalog for validation
+            tenant_layouts: Optional list of tenant SKU layouts (priority order).
+                Each dict: id, name, pattern, pattern_type, allow_hyphen_variants
         """
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         self.valid_skus = valid_skus or set()
+        self.tenant_layouts = tenant_layouts or []
     
     async def parse_pdf(self, pdf_content: bytes, filename: str = "picklist.pdf") -> List[PicklistItem]:
         """
@@ -114,8 +123,11 @@ class PDFParserService:
         try:
             from app.services.robust_pdf_parser import RobustPDFParser
             
-            # Initialize parser with valid SKUs catalog
-            parser = RobustPDFParser(valid_skus=self.valid_skus)
+            # Initialize parser with valid SKUs catalog and optional tenant layouts
+            parser = RobustPDFParser(
+                valid_skus=self.valid_skus,
+                tenant_layouts=self.tenant_layouts,
+            )
             
             # Parse PDF
             result = parser.parse(pdf_content)
@@ -128,15 +140,18 @@ class PDFParserService:
                     f"Discarded fragments: {', '.join(result.fragmentos_descartados[:5])}"
                 )
             
-            # Convert to PicklistItem format
+            # Convert to PicklistItem format using matches (to retain method/layout_id)
+            match_by_index = {i: m for i, m in enumerate(result.matches)}
             items = []
-            for index, sku in enumerate(result.skus_identificados, start=1):
-                # Default quantity to 1 (can be enhanced later)
+            for index, sku_with_qty in enumerate(result.skus_with_quantities, start=1):
+                match = match_by_index.get(index - 1)
                 items.append(PicklistItem(
-                    sku=sku,
-                    quantity=1,
+                    sku=sku_with_qty.sku,
+                    quantity=sku_with_qty.quantity,
                     size_label=None,
-                    position=index  # ✅ Preservar ordem EXATA do PDF (já corrigida por page_num)
+                    position=index,
+                    extraction_method=match.method if match else None,
+                    layout_id=getattr(match, "layout_id", None) if match else None,
                 ))
             
             self.logger.info(

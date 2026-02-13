@@ -30,6 +30,7 @@ class JobItemStatus:
     RESOLVED = "resolved"
     MISSING = "missing"
     AMBIGUOUS = "ambiguous"
+    SKIPPED = "skipped"  # User chose to skip this item (generate base without it)
     PACKED = "packed"
 
 
@@ -107,6 +108,7 @@ class JobDetailResponse(BaseModel):
     items_count: int = Field(0, description="Total number of items")
     items_resolved: int = Field(0, description="Number of resolved items")
     items_pending: int = Field(0, description="Number of items needing input")
+    items_skipped: int = Field(0, description="Number of skipped items")
 
 
 class JobListItem(BaseModel):
@@ -148,9 +150,13 @@ class PendingItemResponse(BaseModel):
     
     id: int
     sku: str
+    sku_design: Optional[str] = Field(
+        None,
+        description="SKU with tenant sizing prefixes stripped (design-only), for display and matching"
+    )
     quantity: int
     size_label: Optional[str]
-    status: str  # 'missing' or 'ambiguous'
+    status: str  # 'missing', 'ambiguous', or 'needs_input' (render failure)
     candidates: List[AssetCandidate] = Field(
         default_factory=list,
         description="Candidate assets (empty for missing SKUs)"
@@ -185,5 +191,24 @@ class JobResolveResponse(BaseModel):
     
     status: str
     resolved_count: int
+    job_status: str
+    message: str
+
+
+class JobSkipRequest(BaseModel):
+    """Request to skip job items (generate base without them)."""
+    
+    item_ids: List[int] = Field(
+        ...,
+        description="List of item IDs to skip",
+        min_length=1
+    )
+
+
+class JobSkipResponse(BaseModel):
+    """Response after skipping items."""
+    
+    status: str
+    skipped_count: int
     job_status: str
     message: str

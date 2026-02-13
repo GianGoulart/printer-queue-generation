@@ -8,6 +8,7 @@ from app.models.asset import Asset
 from app.models.job import Job
 from app.models.job_item import JobItem
 from app.models.sizing_profile import SizingProfile
+from app.models.sku_layout import SkuLayout
 
 __all__ = [
     "Base",
@@ -18,4 +19,5 @@ __all__ = [
     "Job",
     "JobItem",
     "SizingProfile",
+    "SkuLayout",
 ]
