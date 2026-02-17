@@ -219,7 +219,12 @@ def process_job(self, job_id: int) -> dict:
                     SizingProfile.tenant_id == job.tenant_id,
                     SizingProfile.sku_prefix.isnot(None),
                 ).all()
-                sizing_prefixes = [p.sku_prefix.lower().replace("-", "").strip() for p in profiles if p.sku_prefix]
+                # Normalize like resolver: lowercase, no hyphens/underscores, so "plus_size" matches "plussizemoonsun"
+                sizing_prefixes = [
+                    p.sku_prefix.lower().replace("-", "").replace("_", "").strip()
+                    for p in profiles
+                    if p.sku_prefix
+                ]
                 if sizing_prefixes:
                     logger.info(f"Resolve by design: using sizing prefixes {sizing_prefixes} for asset lookup")
             except Exception as e:

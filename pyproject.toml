@@ -1,3 +1,7 @@
+[project]
+name = "printer-queue-generation"
+requires-python = ">=3.11"
+
 [tool.black]
 line-length = 120
 target-version = ['py311']

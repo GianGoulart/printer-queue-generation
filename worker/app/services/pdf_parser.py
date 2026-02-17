@@ -1,5 +1,6 @@
-"""PDF Parser Service using Docling and RobustPDFParser."""
+"""PDF Parser Service using MarkItDown (optional), RobustPDFParser, and Docling."""
 
+import io
 import logging
 import re
 import tempfile
@@ -9,6 +10,10 @@ from typing import List, Optional, Set
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
+
+# Regex for "SKU: value" and "Quantidade: N / M" in markdown from MarkItDown
+RE_SKU_LINE = re.compile(r"^SKU:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+RE_QUANTITY_LINE = re.compile(r"^Quantidade:\s*(\d+)", re.IGNORECASE | re.MULTILINE)
 
 
 class PicklistItem(BaseModel):
@@ -71,7 +76,17 @@ class PDFParserService:
         if file_size_mb > self.MAX_FILE_SIZE_MB:
             raise PDFParserError(f"File too large: {file_size_mb:.2f}MB (max {self.MAX_FILE_SIZE_MB}MB)")
         
-        # Try RobustPDFParser first (if we have valid SKUs catalog)
+        # Try MarkItDown first when we have tenant layouts (best for "SKU: value" picklists)
+        if self.tenant_layouts:
+            items = self._parse_with_markitdown(pdf_content)
+            if items:
+                self.logger.info(
+                    f"✅ MarkItDown + layout extracted {len(items)} items from {filename}"
+                )
+                return items
+            self.logger.debug("MarkItDown returned no items, continuing with RobustPDFParser")
+        
+        # Try RobustPDFParser (if we have valid SKUs catalog)
         if self.valid_skus:
             try:
                 self.logger.info("Attempting to parse with RobustPDFParser (coordinate-based)")
@@ -110,6 +125,117 @@ class PDFParserService:
             if tmp_path.exists():
                 tmp_path.unlink()
     
+    def _parse_with_markitdown(self, pdf_content: bytes) -> List[PicklistItem]:
+        """
+        Convert PDF to Markdown with MarkItDown, then extract SKUs from "SKU: value" lines
+        using tenant layout patterns (e.g. {tamanho}-{sku}). Best for structured picklists.
+        """
+        try:
+            from markitdown import MarkItDown
+        except ImportError:
+            self.logger.debug("MarkItDown not installed, skipping markdown-based parsing")
+            return []
+
+        try:
+            md = MarkItDown()
+            # convert() accepts a path; use a temp file
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(pdf_content)
+                tmp_path = tmp.name
+            try:
+                result = md.convert(tmp_path)
+                text = result.text_content if result and getattr(result, "text_content", None) else ""
+            finally:
+                Path(tmp_path).unlink(missing_ok=True)
+
+            if not (text and text.strip()):
+                self.logger.debug("MarkItDown returned empty text")
+                return []
+
+            items = self._parse_markdown_skus(text)
+            if items:
+                for i, item in enumerate(items, start=1):
+                    item.position = i
+                self.logger.info(
+                    f"MarkItDown + layout: extracted {len(items)} SKUs. "
+                    f"First 5: {[item.sku for item in items[:5]]}"
+                )
+            return items
+        except Exception as e:
+            self.logger.warning(f"MarkItDown parsing failed: {e}", exc_info=True)
+            return []
+
+    def _parse_markdown_skus(self, markdown_text: str) -> List[PicklistItem]:
+        """
+        Parse markdown for lines "SKU: value" and optional "Quantidade: N".
+        Validates value with tenant layout (e.g. {tamanho}-{sku}) when available.
+        """
+        lines = markdown_text.splitlines()
+        items: List[PicklistItem] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            sku_match = RE_SKU_LINE.match(line.strip())
+            if sku_match:
+                value = sku_match.group(1).strip()
+                # Remove trailing .png/.jpg if present
+                if value and "." in value:
+                    ext = value.rsplit(".", 1)[-1].lower()
+                    if ext in ("png", "jpg", "jpeg", "gif", "pdf"):
+                        value = value.rsplit(".", 1)[0].strip()
+                quantity = 1
+                # Look ahead for Quantidade: N
+                for j in range(i + 1, min(i + 5, len(lines))):
+                    qty_match = RE_QUANTITY_LINE.match(lines[j].strip())
+                    if qty_match:
+                        try:
+                            quantity = int(qty_match.group(1))
+                        except ValueError:
+                            pass
+                        break
+                # Validate with tenant layout if available
+                if self.tenant_layouts and value:
+                    from app.services.layout_matcher import find_matches as layout_find_matches
+                    accepted = False
+                    layout_id = None
+                    for layout in self.tenant_layouts:
+                        raw_matches = layout_find_matches(
+                            value,
+                            pattern=layout.get("pattern", ""),
+                            pattern_type=layout.get("pattern_type", "regex"),
+                            allow_hyphen_variants=layout.get("allow_hyphen_variants", True),
+                            full_line=True,
+                        )
+                        if raw_matches:
+                            accepted = True
+                            layout_id = layout.get("id")
+                            break
+                    if not accepted and value:
+                        # No layout or no match: accept if segment-segment (e.g. tamanho-sku)
+                        if re.match(r"^[a-z0-9]+[-_][a-z0-9][a-z0-9\-_]*$", value, re.IGNORECASE):
+                            accepted = True
+                    if accepted:
+                        items.append(PicklistItem(
+                            sku=value,
+                            quantity=quantity,
+                            size_label=None,
+                            position=len(items) + 1,
+                            extraction_method="markitdown_layout",
+                            layout_id=layout_id,
+                        ))
+                elif value and re.match(r"^[a-z0-9]+[-_][a-z0-9][a-z0-9\-_]*$", value, re.IGNORECASE):
+                    # No layouts: accept segment-segment pattern
+                    items.append(PicklistItem(
+                        sku=value,
+                        quantity=quantity,
+                        size_label=None,
+                        position=len(items) + 1,
+                        extraction_method="markitdown",
+                        layout_id=None,
+                    ))
+            i += 1
+        return items
+
     def _parse_with_robust_parser(self, pdf_content: bytes) -> List[PicklistItem]:
         """
         Parse PDF using RobustPDFParser (coordinate-based extraction).

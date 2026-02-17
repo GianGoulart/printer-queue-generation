@@ -95,6 +95,11 @@ class RobustPDFParser:
     
     # Pattern to match quantities (numbers)
     QUANTITY_PATTERN = re.compile(r'\b(\d+)\b')
+    # Explicit "Quantidade: N" or "Quantidade: N / M" so we don't take digits from SKU/filename (e.g. neymar15)
+    QUANTITY_LABEL_PATTERN = re.compile(
+        r'Quantidade\s*:\s*(\d+)(?:\s*/\s*\d+)?',
+        re.IGNORECASE
+    )
     
     def __init__(
         self,
@@ -202,52 +207,85 @@ class RobustPDFParser:
         self.logger.info(f"Reconstructed {len(lines)} lines from {len(pages)} pages")
         return lines
     
-    def extract_quantity_from_line(self, line: Line, sku_match_end: int) -> Optional[int]:
+    @staticmethod
+    def _trailing_digits(sku_text: str) -> Optional[int]:
+        """Return the trailing digits of SKU (e.g. 'mario10' -> 10, 'neymar15' -> 15) or None."""
+        if not sku_text:
+            return None
+        m = re.search(r"(\d+)\s*$", sku_text)
+        return int(m.group(1)) if m else None
+
+    def extract_quantity_from_line(
+        self, line: Line, sku_match_end: int, sku_text: Optional[str] = None
+    ) -> Optional[int]:
         """
         Extract quantity from the same line, looking for numbers after the SKU.
-        
-        In table format like "SKU  Imagem  Quantidade", the quantity is typically
-        the last number in the line or the number after the SKU.
-        
-        Args:
-            line: Line object
-            sku_match_end: End position of SKU match in line text
-            
-        Returns:
-            Quantity if found, None otherwise
+        Prefers explicit "Quantidade: N" or "Quantidade: N / M" so we don't take
+        digits that are part of the SKU or filename (e.g. neymar15, neymar15.png).
+        If sku_text is provided, rejects fallback quantities that equal the SKU's
+        trailing digits (e.g. 10 from mario10, 15 from neymar15).
         """
         # Look for numbers in the line text after the SKU
         remaining_text = line.text[sku_match_end:].strip()
-        
-        # Skip common separators (tabs, spaces, etc.)
-        remaining_text = remaining_text.lstrip('\t \n\r')
-        
-        # Try to find a number that looks like a quantity (typically 1-4 digits)
-        # Look for standalone numbers (not part of other text)
+        remaining_text = remaining_text.lstrip("\t \n\r")
+
+        # Prefer explicit "Quantidade: N" or "Quantidade: N / M" (avoids using 15 from neymar15)
+        qty_label = self.QUANTITY_LABEL_PATTERN.search(remaining_text)
+        if qty_label:
+            quantity = int(qty_label.group(1))
+            if 1 <= quantity <= 999:
+                self.logger.debug(
+                    f"Extracted quantity {quantity} from 'Quantidade: N' in line: {line.text[:80]}"
+                )
+                return quantity
+
+        # Fallback: standalone numbers (table format). Reject if equal to SKU trailing digits
+        trailing = self._trailing_digits(sku_text) if sku_text else None
         quantity_matches = self.QUANTITY_PATTERN.findall(remaining_text)
-        
         if quantity_matches:
-            # In table format, the quantity is usually the last number in the line
-            # or the first number after the SKU (if there's an image column)
-            # Try the last number first (most likely to be quantity in a table)
-            try:
-                quantity = int(quantity_matches[-1])
-                # Sanity check: quantities are usually between 1 and 999
+            for cand in (quantity_matches[0], quantity_matches[-1]):
+                try:
+                    quantity = int(cand)
+                    if 1 <= quantity <= 999 and quantity != trailing:
+                        self.logger.debug(
+                            f"Extracted quantity {quantity} from line: {line.text[:80]}"
+                        )
+                        return quantity
+                    if quantity == trailing:
+                        self.logger.debug(
+                            f"Rejecting quantity {quantity} (same as SKU trailing digits): {sku_text}"
+                        )
+                except (ValueError, IndexError):
+                    pass
+
+        return None
+
+    def extract_quantity_from_line_or_next(
+        self,
+        line: Line,
+        sku_match_end: int,
+        next_lines: Optional[List[Line]] = None,
+        sku_text: Optional[str] = None,
+    ) -> Optional[int]:
+        """
+        Extract quantity from current line or from following lines (e.g. "Quantidade: 1 / 1" on next line).
+        Use this when the PDF has SKU on one line and "Quantidade: N" on the next.
+        sku_text is used to reject fallback quantities that equal the SKU trailing digits (e.g. 10 from mario10).
+        """
+        q = self.extract_quantity_from_line(line, sku_match_end, sku_text=sku_text)
+        if q is not None:
+            return q
+        if not next_lines:
+            return None
+        for next_line in next_lines:
+            qty_label = self.QUANTITY_LABEL_PATTERN.search(next_line.text)
+            if qty_label:
+                quantity = int(qty_label.group(1))
                 if 1 <= quantity <= 999:
-                    self.logger.debug(f"Extracted quantity {quantity} from line: {line.text[:80]}")
+                    self.logger.debug(
+                        f"Extracted quantity {quantity} from next line 'Quantidade: N': {next_line.text[:60]}"
+                    )
                     return quantity
-            except (ValueError, IndexError):
-                pass
-            
-            # Fallback: try the first number
-            try:
-                quantity = int(quantity_matches[0])
-                if 1 <= quantity <= 999:
-                    self.logger.debug(f"Extracted quantity {quantity} (first match) from line: {line.text[:80]}")
-                    return quantity
-            except (ValueError, IndexError):
-                pass
-        
         return None
     
     def normalize_sku_from_pdf(self, raw_sku: str) -> str:
@@ -279,33 +317,28 @@ class RobustPDFParser:
         sku = re.sub(r"[^a-z0-9]", "", sku)
         return sku
     
-    def extract_skus_with_regex(self, line: Line, line_num: int) -> List[SKUMatch]:
+    def extract_skus_with_regex(
+        self, line: Line, line_num: int, next_lines: Optional[List[Line]] = None
+    ) -> List[SKUMatch]:
         """
         Extract SKUs using regex patterns, also extracting quantities when available.
-        Supports both standard format (prefix-num-num-name-variant) and simple format (alphanumeric).
-        
-        Args:
-            line: Line object
-            line_num: Line number for tracking
-            
-        Returns:
-            List of SKUMatch objects
+        If next_lines is provided, looks for "Quantidade: N" on the next line(s).
         """
         matches = []
-        found_positions = set()  # Track positions to avoid duplicates
-        
-        # Try standard 5-segment pattern first (prefix-num-num-name-variant)
+        found_positions = set()
+
+        def _qty(end_pos: int, raw_sku: Optional[str] = None):
+            return self.extract_quantity_from_line_or_next(
+                line, end_pos, next_lines, sku_text=raw_sku
+            )
+
         for match in self.SKU_PATTERN_STANDARD_5.finditer(line.text):
             raw_sku = match.group(0).lower()
             start_pos = match.start()
             end_pos = match.end()
-            
-            # Skip if already found at this position (avoid duplicates)
             if (start_pos, end_pos) in found_positions:
                 continue
             found_positions.add((start_pos, end_pos))
-            
-            # Store raw token from picklist (e.g. u-7-4-butterfly-p); resolver normalizes for lookup
             raw_stored = raw_sku.rsplit(".", 1)[0] if "." in raw_sku else raw_sku
             sku_norm = self.normalize_sku_from_pdf(raw_sku)
             if self.valid_skus and sku_norm not in self.valid_skus:
@@ -313,7 +346,7 @@ class RobustPDFParser:
                     f"SKU '{sku_norm}' (from '{raw_sku}') matches pattern but not in catalog. "
                     f"Will be marked as 'missing' in resolution phase (line {line_num})"
                 )
-            quantity = self.extract_quantity_from_line(line, end_pos)
+            quantity = _qty(end_pos, raw_sku)
             matches.append(SKUMatch(
                 sku=raw_stored,
                 quantity=quantity,
@@ -332,12 +365,9 @@ class RobustPDFParser:
             raw_sku = match.group(0).lower()
             start_pos = match.start()
             end_pos = match.end()
-            
-            # Skip if already found at this position (avoid duplicates)
             if (start_pos, end_pos) in found_positions:
                 continue
             found_positions.add((start_pos, end_pos))
-            
             raw_stored = raw_sku.rsplit(".", 1)[0] if "." in raw_sku else raw_sku
             sku_norm = self.normalize_sku_from_pdf(raw_sku)
             if self.valid_skus and sku_norm not in self.valid_skus:
@@ -345,7 +375,7 @@ class RobustPDFParser:
                     f"SKU '{sku_norm}' (from '{raw_sku}') matches 4-segment pattern but not in catalog. "
                     f"Will be marked as 'missing' in resolution phase (line {line_num})"
                 )
-            quantity = self.extract_quantity_from_line(line, end_pos)
+            quantity = _qty(end_pos, raw_sku)
             matches.append(SKUMatch(
                 sku=raw_stored,
                 quantity=quantity,
@@ -362,12 +392,12 @@ class RobustPDFParser:
         # Try simple pattern for SKUs that don't match standard format (e.g., b99, hallowen)
         # Only if no standard matches found to avoid false positives
         if not matches:
-            # Common words to exclude (Portuguese and English)
+            # Only exclude obvious labels (never valid SKUs). Do not exclude words that can be part of SKU (e.g. super, plus, infantil).
             excluded_words = {
                 'sku', 'imagem', 'quantidade', 'qtd', 'page', 'of', 'picklist',
                 'itens', 'skus', 'repetidos', 'com', 'variadas', 'total',
                 'p', 'm', 'g', 'gg', 'xg', 'pp', 's', 'l', 'xl', 'xxl',
-                'bl', 'inf', 'plus', 'u', 's', 'm'  # Common prefixes (too short alone)
+                'bl', 'inf', 'u', 's', 'm',  # Short prefixes when alone (too ambiguous)
             }
             
             for match in self.SKU_PATTERN_SIMPLE.finditer(line.text):
@@ -409,7 +439,7 @@ class RobustPDFParser:
                                 f"SKU '{sku}' (from '{raw_sku}') matches simple pattern but not in catalog. "
                                 f"Will be marked as 'missing' in resolution phase (line {line_num})"
                             )
-                        quantity = self.extract_quantity_from_line(line, end_pos)
+                        quantity = _qty(end_pos, raw_sku)
                         matches.append(SKUMatch(
                             sku=raw_stored,
                             quantity=quantity,
@@ -425,33 +455,25 @@ class RobustPDFParser:
         
         return matches
     
-    def extract_skus_with_heuristic(self, line: Line, line_num: int) -> List[SKUMatch]:
+    def extract_skus_with_heuristic(
+        self, line: Line, line_num: int, next_lines: Optional[List[Line]] = None
+    ) -> List[SKUMatch]:
         """
         Extract SKUs using "SKU:" heuristic, also extracting quantities when available.
-        
-        Looks for pattern: "SKU: xxx-xxx-xxx" or "SKU:xxx-xxx-xxx"
-        
-        Args:
-            line: Line object
-            line_num: Line number for tracking
-            
-        Returns:
-            List of SKUMatch objects
+        If next_lines is provided, looks for "Quantidade: N" on the next line(s).
         """
         matches = []
-        
-        # Look for "SKU" keyword
         text_lower = line.text.lower()
         if "sku" not in text_lower:
             return matches
-        
-        # Find position of "SKU" and extract text after it
         sku_index = text_lower.find("sku")
-        after_sku = line.text[sku_index + 3:].strip()
-        
-        # Remove common separators
-        after_sku = after_sku.lstrip(":").strip()
-        
+        after_sku = line.text[sku_index + 3:].strip().lstrip(":").strip()
+
+        def _qty(sku_match_end: int, raw_sku: Optional[str] = None):
+            return self.extract_quantity_from_line_or_next(
+                line, sku_match_end, next_lines, sku_text=raw_sku
+            )
+
         for match in self.SKU_PATTERN_STANDARD_5.finditer(after_sku):
             raw_sku = match.group(0).lower()
             sku_match_end = sku_index + 3 + match.end()
@@ -462,7 +484,7 @@ class RobustPDFParser:
                     f"SKU '{sku_norm}' (from '{raw_sku}') matches pattern but not in catalog. "
                     f"Will be marked as 'missing' in resolution phase (line {line_num})"
                 )
-            quantity = self.extract_quantity_from_line(line, sku_match_end)
+            quantity = _qty(sku_match_end, raw_sku)
             matches.append(SKUMatch(
                 sku=raw_stored,
                 quantity=quantity,
@@ -487,7 +509,7 @@ class RobustPDFParser:
                         f"SKU '{sku_norm}' (from '{raw_sku}') matches 4-segment pattern but not in catalog. "
                         f"Will be marked as 'missing' in resolution phase (line {line_num})"
                     )
-                quantity = self.extract_quantity_from_line(line, sku_match_end)
+                quantity = _qty(sku_match_end, raw_sku)
                 matches.append(SKUMatch(
                     sku=raw_stored,
                     quantity=quantity,
@@ -500,6 +522,62 @@ class RobustPDFParser:
                     self.logger.debug(f"Heuristic matched (4-seg): {raw_stored} (from {raw_sku}) with quantity {quantity} (line {line_num})")
                 else:
                     self.logger.debug(f"Heuristic matched (4-seg): {raw_stored} (from {raw_sku}) (line {line_num}, no quantity found)")
+        
+        # "SKU: value" format (e.g. "SKU: infantil-mario10", "SKU: plus_size-moonsun") — try tenant layout or segment-segment pattern
+        if not matches and after_sku:
+            # First token after "SKU:" (e.g. "infantil-mario10" or "infantil-mario10.png")
+            value_token = after_sku.split()[0].strip() if after_sku.split() else after_sku.strip()
+            if value_token:
+                value_clean = value_token.rsplit(".", 1)[0] if "." in value_token and value_token.rsplit(".", 1)[-1].lower() in ("png", "jpg", "jpeg", "gif", "pdf") else value_token
+                value_clean = value_clean.strip()
+            else:
+                value_clean = ""
+            if value_clean:
+                # Try tenant layout on the value (e.g. mask {tamanho}-{sku} matches "infantil-mario10")
+                layout_matched = False
+                if self.tenant_layouts:
+                    try:
+                        from app.services.layout_matcher import find_matches as layout_find_matches
+                        for layout in self.tenant_layouts:
+                            raw_matches = layout_find_matches(
+                                value_clean,
+                                pattern=layout.get("pattern", ""),
+                                pattern_type=layout.get("pattern_type", "regex"),
+                                allow_hyphen_variants=layout.get("allow_hyphen_variants", True),
+                                full_line=True,
+                            )
+                            if raw_matches:
+                                layout_id = layout.get("id")
+                                full_match = raw_matches[0][0]
+                                raw_stored = full_match.rsplit(".", 1)[0] if "." in full_match else full_match
+                                quantity = _qty(sku_index + 3 + len(value_token), full_match)
+                                matches.append(SKUMatch(
+                                    sku=raw_stored,
+                                    quantity=quantity,
+                                    method="heuristic",
+                                    confidence=1.0,
+                                    fragments_used=[full_match],
+                                    line_number=line_num,
+                                    layout_id=layout_id,
+                                ))
+                                layout_matched = True
+                                self.logger.debug(f"Heuristic 'SKU: value' matched layout on: {raw_stored} (line {line_num})")
+                                break
+                    except Exception as e:
+                        self.logger.debug(f"Layout match on 'SKU: value' failed: {e}")
+                # No layout or no match: accept value if it looks like segment-segment (e.g. tamanho-sku)
+                if not layout_matched and re.match(r"^[a-z0-9]+[-_][a-z0-9][a-z0-9\-_]*$", value_clean, re.IGNORECASE):
+                    raw_stored = value_clean
+                    quantity = _qty(sku_index + 3 + len(value_token), value_clean)
+                    matches.append(SKUMatch(
+                        sku=raw_stored,
+                        quantity=quantity,
+                        method="heuristic",
+                        confidence=0.95,
+                        fragments_used=[value_clean],
+                        line_number=line_num,
+                    ))
+                    self.logger.debug(f"Heuristic 'SKU: value' accepted as segment-segment: {raw_stored} (line {line_num})")
         
         return matches
     
@@ -546,7 +624,9 @@ class RobustPDFParser:
                 fragment_pos = line.text.lower().find(fragment)
                 if fragment_pos >= 0:
                     sku_match_end = fragment_pos + len(fragment)
-                    quantity = self.extract_quantity_from_line(line, sku_match_end)
+                    quantity = self.extract_quantity_from_line_or_next(
+                        line, sku_match_end, None, sku_text=matched_sku or fragment
+                    )
                 else:
                     quantity = None
                 
@@ -603,139 +683,142 @@ class RobustPDFParser:
         all_matches = []
         found_skus_ordered = []  # Maintain Top-Down order
         all_fragments_used = []
+        # Build ordered list of (line_obj, line_count) so we can look at next line for "Quantidade: N"
+        line_entries: List[Tuple[Line, int]] = []
         line_count = 0
-        
-        # Process each page in order
         for page_num in sorted(pages.keys()):
             page_words = pages[page_num]
-            
-            # Group words by Y coordinate (lines) within this page
             y_groups = defaultdict(list)
             for word in page_words:
                 found_group = False
-                for y_key in y_groups.keys():
+                for y_key in list(y_groups.keys()):
                     if abs(word.y0 - y_key) <= self.Y_TOLERANCE:
                         y_groups[y_key].append(word)
                         found_group = True
                         break
                 if not found_group:
                     y_groups[word.y0].append(word)
-            
-            # Sort lines by Y (Top -> Bottom)
-            sorted_y_keys = sorted(y_groups.keys())
-            
-            # Process each line in geometric order
-            for y in sorted_y_keys:
+            for y in sorted(y_groups.keys()):
                 line_count += 1
-                
-                # Sort words within line by X (Left -> Right)
                 line_words = sorted(y_groups[y], key=lambda w: w.x0)
                 line_text = " ".join(w.text for w in line_words)
-                
-                line_obj = Line(
-                    text=line_text,
-                    words=line_words,
-                    y=y,
-                    page_num=page_num
+                line_obj = Line(text=line_text, words=line_words, y=y, page_num=page_num)
+                line_entries.append((line_obj, line_count))
+
+        # Process each line with access to next lines (for "Quantidade: N" on following line)
+        for i, (line_obj, line_count) in enumerate(line_entries):
+            line_text = line_obj.text
+            next_line_objs = [le[0] for le in line_entries[i + 1 : i + 5]]
+
+            def qty(line: Line, end: int, sku_text: Optional[str] = None):
+                return self.extract_quantity_from_line_or_next(
+                    line, end, next_line_objs or None, sku_text=sku_text
                 )
-                
-                # Extract SKUs from this line (maintain order)
-                current_line_matches = []
 
-                # Use first token only (SKU before space/quantity) for full-line match.
-                line_first_token = (line_text.split() or [""])[0].strip()
-                line_first_token_normalized = self.normalize_sku_from_pdf(line_first_token) if line_first_token else ""
+            current_line_matches: List[SKUMatch] = []
+            line_first_token = (line_text.split() or [""])[0].strip()
+            line_first_token_normalized = self.normalize_sku_from_pdf(line_first_token) if line_first_token else ""
 
-                # Skip header line (e.g. "picklist 150") — do not add any match for this line
-                if line_first_token_normalized == "picklist":
-                    self.logger.debug(f"Skipping header line {line_count}: first token 'picklist'")
-                    continue
+            if line_first_token_normalized == "picklist":
+                self.logger.debug(f"Skipping header line {line_count}: first token 'picklist'")
+                continue
 
-                # Try tenant SKU layouts first (priority order).
-                # full_line=True so a 4-segment layout only matches lines with exactly 4 segments,
-                # not "inf-9-4-naruto" inside "inf-9-4-naruto-m" (5 segments).
-                if self.tenant_layouts and line_first_token:
-                    from app.services.layout_matcher import find_matches as layout_find_matches
-                    for layout in self.tenant_layouts:
-                        raw_matches = layout_find_matches(
-                            line_first_token,
-                            pattern=layout.get("pattern", ""),
-                            pattern_type=layout.get("pattern_type", "regex"),
-                            allow_hyphen_variants=layout.get("allow_hyphen_variants", True),
-                            full_line=True,
-                        )
-                        if raw_matches:
-                            layout_id = layout.get("id")
-                            layout_name = layout.get("name", "")
-                            for full_match, _start, end_pos, groups in raw_matches:
-                                # Store raw token from picklist (e.g. bl-7-4-butterfly-p) so item.sku matches PDF; resolver normalizes for lookup
-                                raw_sku = full_match.rsplit(".", 1)[0] if "." in full_match else full_match
-                                quantity = self.extract_quantity_from_line(line_obj, end_pos)
-                                current_line_matches.append(SKUMatch(
-                                    sku=raw_sku,
-                                    quantity=quantity,
-                                    method="layout",
-                                    confidence=1.0,
-                                    fragments_used=[full_match],
-                                    line_number=line_count,
-                                    layout_id=layout_id,
-                                ))
-                            self.logger.debug(
-                                f"Layout '{layout_name}' (id={layout_id}) matched line {line_count}: {[m.sku for m in current_line_matches]}"
-                            )
-                            break
-
-                # Fallback: try built-in Regex
-                if not current_line_matches:
-                    regex_matches = self.extract_skus_with_regex(line_obj, line_count)
-                    if regex_matches:
-                        current_line_matches.extend(regex_matches)
-
-                # Try Heuristic if no regex match
-                if not current_line_matches:
-                    heuristic_matches = self.extract_skus_with_heuristic(line_obj, line_count)
-                    if heuristic_matches:
-                        current_line_matches.extend(heuristic_matches)
-                
-                # Try Fuzzy matching as last resort
-                if not current_line_matches:
-                    fuzzy_matches = self.fuzzy_match_fragments(line_obj, line_count, set())
-                    if fuzzy_matches:
-                        current_line_matches.extend(fuzzy_matches)
-                
-                # Last resort: if line has no match but has a first token that looks like a SKU,
-                # use it so we don't lose the line (150 lines -> 150 items).
-                # Do NOT use first_token when it is purely numeric (e.g. "1", "2", "10", "150" — line numbers).
-                if not current_line_matches and line_first_token:
-                    first_token_normalized = self.normalize_sku_from_pdf(line_first_token)
-                    if (
-                        len(first_token_normalized) >= 2
-                        and first_token_normalized.isalnum()
-                        and not first_token_normalized.isdigit()
-                    ):
-                        quantity = self.extract_quantity_from_line(line_obj, len(line_first_token))
-                        raw_first = line_first_token.rsplit(".", 1)[0] if "." in line_first_token else line_first_token
-                        current_line_matches.append(SKUMatch(
-                            sku=raw_first,
-                            quantity=quantity,
-                            method="first_token",
-                            confidence=0.5,
-                            fragments_used=[line_first_token],
-                            line_number=line_count,
-                        ))
+            if self.tenant_layouts and line_first_token:
+                from app.services.layout_matcher import find_matches as layout_find_matches
+                for layout in self.tenant_layouts:
+                    raw_matches = layout_find_matches(
+                        line_first_token,
+                        pattern=layout.get("pattern", ""),
+                        pattern_type=layout.get("pattern_type", "regex"),
+                        allow_hyphen_variants=layout.get("allow_hyphen_variants", True),
+                        full_line=True,
+                    )
+                    if raw_matches:
+                        layout_id = layout.get("id")
+                        layout_name = layout.get("name", "")
+                        for full_match, _start, end_pos, groups in raw_matches:
+                            raw_sku = full_match.rsplit(".", 1)[0] if "." in full_match else full_match
+                            quantity = qty(line_obj, end_pos, full_match)
+                            current_line_matches.append(SKUMatch(
+                                sku=raw_sku,
+                                quantity=quantity,
+                                method="layout",
+                                confidence=1.0,
+                                fragments_used=[full_match],
+                                line_number=line_count,
+                                layout_id=layout_id,
+                            ))
                         self.logger.debug(
-                            f"Line {line_count} had no layout/regex/heuristic/fuzzy match; "
-                            f"using first token as SKU: {raw_first}"
+                            f"Layout '{layout_name}' (id={layout_id}) matched line {line_count}: {[m.sku for m in current_line_matches]}"
                         )
-                
-                # Drop numeric-only SKUs (line numbers like "1", "2", ... "150" mistaken as SKUs)
-                current_line_matches = [m for m in current_line_matches if not (m.sku and m.sku.isdigit())]
-                
-                # Add ALL matches to global list in order found (allow duplicates)
-                for match in current_line_matches:
-                    all_matches.append(match)
-                    found_skus_ordered.append(match.sku)
-                    all_fragments_used.extend(match.fragments_used)
+                        break
+
+            if self.tenant_layouts and not current_line_matches and "sku" not in line_text.lower():
+                self.logger.debug(f"Line {line_count} has no layout match and no 'SKU:' — skipping (structural filter)")
+                continue
+
+            if not current_line_matches and "sku" in line_text.lower():
+                heuristic_matches = self.extract_skus_with_heuristic(
+                    line_obj, line_count, next_lines=next_line_objs
+                )
+                if heuristic_matches:
+                    current_line_matches.extend(heuristic_matches)
+
+            if not current_line_matches:
+                regex_matches = self.extract_skus_with_regex(
+                    line_obj, line_count, next_lines=next_line_objs
+                )
+                if regex_matches:
+                    current_line_matches.extend(regex_matches)
+
+            if not current_line_matches:
+                heuristic_matches = self.extract_skus_with_heuristic(
+                    line_obj, line_count, next_lines=next_line_objs
+                )
+                if heuristic_matches:
+                    current_line_matches.extend(heuristic_matches)
+
+            if not current_line_matches:
+                fuzzy_matches = self.fuzzy_match_fragments(line_obj, line_count, set())
+                if fuzzy_matches:
+                    current_line_matches.extend(fuzzy_matches)
+
+            _excluded_first_tokens = {
+                "picklist", "sku", "quantidade", "plataforma", "arquivo", "cada", "corresponde",
+                "exatamente", "nome", "size", "shein", "exemplo", "teste", "versao",
+                "detalhada", "imagem", "imagens",
+            }
+            if not current_line_matches and line_first_token:
+                first_token_normalized = self.normalize_sku_from_pdf(line_first_token)
+                if (
+                    len(first_token_normalized) >= 2
+                    and first_token_normalized.isalnum()
+                    and not first_token_normalized.isdigit()
+                    and first_token_normalized not in _excluded_first_tokens
+                ):
+                    quantity = qty(line_obj, len(line_first_token), line_first_token)
+                    raw_first = line_first_token.rsplit(".", 1)[0] if "." in line_first_token else line_first_token
+                    current_line_matches.append(SKUMatch(
+                        sku=raw_first,
+                        quantity=quantity,
+                        method="first_token",
+                        confidence=0.5,
+                        fragments_used=[line_first_token],
+                        line_number=line_count,
+                    ))
+                    self.logger.debug(
+                        f"Line {line_count} had no layout/regex/heuristic/fuzzy match; "
+                        f"using first token as SKU: {raw_first}"
+                    )
+
+            # Drop numeric-only SKUs (line numbers like "1", "2", ... "150" mistaken as SKUs)
+            current_line_matches = [m for m in current_line_matches if not (m.sku and m.sku.isdigit())]
+
+            # Add ALL matches to global list in order found (allow duplicates)
+            for match in current_line_matches:
+                all_matches.append(match)
+                found_skus_ordered.append(match.sku)
+                all_fragments_used.extend(match.fragments_used)
         
         # Prefix filter: only drop a match when on the SAME line another match is the
         # longer form (so we never drop a line; we only drop duplicate "short" on same line).
@@ -756,10 +839,16 @@ class RobustPDFParser:
                     to_keep.append(m)
             filtered_matches.extend(to_keep)
         
-        # Post-filter: drop header/numeric-only SKUs that may have slipped through (e.g. from regex on other columns).
+        # Post-filter: only drop obvious document labels (never valid SKU text). Do not exclude words that can be part of SKU.
+        _excluded_skus = {
+            "picklist", "sku", "quantidade", "plataforma", "arquivo", "cada", "corresponde",
+            "exatamente", "nome", "size", "shein", "exemplo", "teste", "versao", "detalhada",
+            "imagem", "imagens",
+        }
         filtered_matches = [
             m for m in filtered_matches
             if m.sku and m.sku != "picklist" and not m.sku.isdigit()
+            and self.normalize_sku_from_pdf(m.sku) not in _excluded_skus
         ]
         filtered_skus = list(dict.fromkeys(m.sku for m in filtered_matches))
         

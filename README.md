@@ -41,6 +41,7 @@ docker-compose run --rm api python -m app.db.seed
 
 ## Pré-requisitos
 
+- Python 3.11+ (para desenvolvimento local)
 - Docker (versão 20.10+)
 - Docker Compose (versão 2.0+)
 - Make (opcional, mas recomendado)

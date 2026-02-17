@@ -27,6 +27,9 @@ pydantic-settings==2.7.1
 docling==2.68.0
 pypdf2==3.0.1
 PyMuPDF==1.23.26  # fitz - for coordinate-based PDF text extraction
+# Optional: MarkItDown for PDF→Markdown (improves "SKU: value" picklists when tenant has SKU layouts).
+# Requires Python 3.11+. Install with: pip install 'markitdown[pdf]'
+# markitdown[pdf]>=0.1.1
 
 # Phase 4 - PDF Generation & Layout
 reportlab==4.0.9

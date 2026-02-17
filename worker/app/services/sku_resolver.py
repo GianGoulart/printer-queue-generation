@@ -36,6 +36,8 @@ class SKUResolverService:
     
     EXACT_MATCH_THRESHOLD = 1.0
     FUZZY_MATCH_THRESHOLD = 0.45  # Lowered so picklist SKUs like s63wolfg4 match asset 3wolfg4 (score ~0.5)
+    # When best candidate is design-only (substring of requested SKU, e.g. moonsun in plussizemoonsun), accept if above this
+    DESIGN_SUBSTRING_THRESHOLD = 0.35
     AMBIGUITY_DIFF_THRESHOLD = 0.1  # If top 2 candidates are within this diff, try substring tie-break
     MAX_CANDIDATES = 5
     
@@ -288,6 +290,22 @@ class SKUResolverService:
                 candidates=candidates,
                 score=top_candidate.score
             )
+        
+        # Design-as-suffix: e.g. plus_size-moonsun -> plussizemoonsun, best candidate moonsun (score 0.44).
+        # Accept when best candidate's sku is a substring of requested (design only) and score is reasonable.
+        if top_candidate.score >= self.DESIGN_SUBSTRING_THRESHOLD:
+            cand_sku = top_candidate.sku.lower()
+            if cand_sku and cand_sku in sku_normalized:
+                self.logger.info(
+                    f"Resolved by design substring: {top_candidate.sku} in {sku_normalized} "
+                    f"(asset_id={top_candidate.asset_id}, score={top_candidate.score:.3f})"
+                )
+                return SkuResolutionResult(
+                    status="resolved",
+                    asset_id=top_candidate.asset_id,
+                    candidates=candidates,
+                    score=top_candidate.score
+                )
         
         # Score too low
         return SkuResolutionResult(
